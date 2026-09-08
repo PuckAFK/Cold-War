@@ -1,0 +1,1513 @@
+--[[
+    PuckAFK Hub · Cold War
+    Aim + ESP · Shared PuckUI
+
+    Built from the inspected place 13687899540 dump.
+
+    Game-specific findings used here:
+      • Standard Player.Character models with Humanoid + HumanoidRootPart
+      • R6-style combat body parts: Head, Torso, Left/Right Arm, Left/Right Leg
+      • Teams: PACT / NATO / Neutral
+      • Custom camera controller updates at RenderPriority.Camera
+      • Recoil updates at RenderPriority.Camera + 1
+      • Weapon firing uses the viewmodel muzzle + BallisticsClient
+
+    Aim is therefore applied at Camera + 2 so the weapon/viewmodel can consume
+    the corrected camera before late-render weapon/crosshair work.
+]]
+
+local compiler = loadstring or load
+if type(compiler) ~= "function" then
+    return warn("[PuckAFK Cold War] loadstring/load unavailable")
+end
+
+local okUI, uiSource = pcall(function()
+    return game:HttpGet("https://raw.githubusercontent.com/PuckAFK/Puck-Loader/main/ui/PuckUI.lua")
+end)
+
+if not okUI or type(uiSource) ~= "string" or #uiSource < 100 then
+    return warn("[PuckAFK Cold War] failed to download shared PuckUI")
+end
+
+local uiChunk, uiError = compiler(uiSource)
+if not uiChunk then
+    return warn("[PuckAFK Cold War] PuckUI compile failed: " .. tostring(uiError))
+end
+
+local okPuck, PuckUI = pcall(uiChunk)
+if not okPuck or type(PuckUI) ~= "table" or type(PuckUI.CreateWindow) ~= "function" then
+    return warn("[PuckAFK Cold War] invalid PuckUI")
+end
+
+local ENV = (getgenv and getgenv()) or _G
+if ENV.__PUCKAFK_COLDWAR_AIM_ESP_CLEANUP then
+    pcall(ENV.__PUCKAFK_COLDWAR_AIM_ESP_CLEANUP)
+end
+
+--// Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+local KNOWN_PLACE_ID = 13687899540
+if game.PlaceId ~= KNOWN_PLACE_ID then
+    warn(("[PuckAFK Cold War] Dump target was PlaceId %d; current PlaceId is %s. Continuing for same-game/subplace compatibility.")
+        :format(KNOWN_PLACE_ID, tostring(game.PlaceId)))
+end
+
+--// Configuration
+local Config = {
+    Aim = {
+        Enabled = true,
+        HoldRMB = true,
+        TeamCheck = true,
+        VisibleCheck = true,
+        AimPoint = "Head", -- Head / Torso / Closest Part
+        FOV = 220,
+        AimSpeed = 30,
+        MaxDistance = 1800,
+        StickyTarget = true,
+        StickyFOVMultiplier = 1.30,
+        Prediction = true,
+        PredictionTime = 0.055,
+        MaxPredictionOffset = 18,
+        ShowFOV = true,
+
+        -- Game-specific fallback/accuracy layer. Camera aim should already feed
+        -- the viewmodel because we run at Camera + 2. Ballistic Align additionally
+        -- redirects ClientFire's outgoing projectile direction at the selected target.
+        BallisticAlign = false,
+        BallisticCompensation = true,
+        PreserveSpread = false,
+    },
+
+    ESP = {
+        Enabled = true,
+        TeamCheck = true,
+        Boxes = true,
+        Names = true,
+        Health = true,
+        Distance = true,
+        Tracers = false,
+        Chams = true,
+        VisibleGreen = true,
+        MaxDistance = 2500,
+    },
+}
+
+local State = {
+    Alive = true,
+    CurrentTarget = nil,
+    CurrentPart = nil,
+    CurrentAimPoint = nil,
+    Connections = {},
+    Drawings = {},
+    Highlights = {},
+    Ballistics = {
+        Installed = false,
+        ClientFire = nil,
+        OriginalFireVolley = nil,
+        Wrapper = nil,
+        WeaponConfigManager = nil,
+    },
+}
+
+--// Helpers
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    State.Connections[#State.Connections + 1] = connection
+    return connection
+end
+
+local function normalizeDropdown(value)
+    if type(value) == "table" then
+        return value[1]
+    end
+    return value
+end
+
+local function safeRemoveDrawing(object)
+    if not object then
+        return
+    end
+    pcall(function()
+        object.Visible = false
+        object:Remove()
+    end)
+end
+
+local function destroyHighlight(player)
+    local highlight = State.Highlights[player]
+    State.Highlights[player] = nil
+    if highlight then
+        pcall(function()
+            highlight:Destroy()
+        end)
+    end
+end
+
+local function destroyESP(player)
+    local bundle = State.Drawings[player]
+    State.Drawings[player] = nil
+    if bundle then
+        for _, object in pairs(bundle) do
+            safeRemoveDrawing(object)
+        end
+    end
+    destroyHighlight(player)
+end
+
+local function getCharacterData(player)
+    if not player or player == LocalPlayer then
+        return nil
+    end
+
+    local character = player.Character
+    if not character or not character.Parent then
+        return nil
+    end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or humanoid.Health <= 0 or not root or not root:IsA("BasePart") then
+        return nil
+    end
+
+    return character, humanoid, root
+end
+
+local function sameTeam(player)
+    local localTeam = LocalPlayer.Team
+    local otherTeam = player and player.Team
+    return localTeam ~= nil and otherTeam ~= nil and localTeam == otherTeam
+end
+
+local function isEnemy(player, teamCheck)
+    if not player or player == LocalPlayer then
+        return false
+    end
+    if teamCheck and sameTeam(player) then
+        return false
+    end
+    return true
+end
+
+local function getAimOrigin2D()
+    Camera = workspace.CurrentCamera or Camera
+    if not Camera then
+        return Vector2.new(0, 0)
+    end
+
+    if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+        local viewport = Camera.ViewportSize
+        return Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
+    end
+
+    local mouse = UserInputService:GetMouseLocation()
+    return Vector2.new(mouse.X, mouse.Y)
+end
+
+local function worldToScreen(position)
+    Camera = workspace.CurrentCamera or Camera
+    if not Camera then
+        return nil, false, -1
+    end
+
+    local point, onScreen = Camera:WorldToViewportPoint(position)
+    return Vector2.new(point.X, point.Y), onScreen, point.Z
+end
+
+local BODY_PART_NAMES = {
+    "Head",
+    "Torso",
+    "HumanoidRootPart",
+    "Left Arm",
+    "Right Arm",
+    "Left Leg",
+    "Right Leg",
+    -- fallback support if the live game ever changes rigs
+    "UpperTorso",
+    "LowerTorso",
+    "LeftUpperArm",
+    "RightUpperArm",
+    "LeftUpperLeg",
+    "RightUpperLeg",
+}
+
+local function getClosestBodyPart(character, screenOrigin)
+    local bestPart = nil
+    local bestDistance = math.huge
+
+    for _, name in ipairs(BODY_PART_NAMES) do
+        local part = character:FindFirstChild(name)
+        if part and part:IsA("BasePart") then
+            local screenPos, _, depth = worldToScreen(part.Position)
+            if screenPos and depth > 0 then
+                local distance = (screenPos - screenOrigin).Magnitude
+                if distance < bestDistance then
+                    bestDistance = distance
+                    bestPart = part
+                end
+            end
+        end
+    end
+
+    return bestPart
+end
+
+local function getTargetPart(character, screenOrigin)
+    local mode = Config.Aim.AimPoint
+
+    if mode == "Closest Part" then
+        return getClosestBodyPart(character, screenOrigin)
+    end
+
+    if mode == "Torso" then
+        return character:FindFirstChild("Torso")
+            or character:FindFirstChild("UpperTorso")
+            or character:FindFirstChild("HumanoidRootPart")
+            or character:FindFirstChild("Head")
+    end
+
+    return character:FindFirstChild("Head")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("HumanoidRootPart")
+end
+
+local function clampPredictionOffset(offset)
+    local maxOffset = math.max(0, tonumber(Config.Aim.MaxPredictionOffset) or 0)
+    if maxOffset > 0 and offset.Magnitude > maxOffset then
+        return offset.Unit * maxOffset
+    end
+    return offset
+end
+
+local function getPredictedPoint(part)
+    if not part or not part:IsA("BasePart") then
+        return nil
+    end
+
+    local point = part.Position
+    if Config.Aim.Prediction then
+        local velocity = part.AssemblyLinearVelocity or Vector3.new()
+        local offset = velocity * math.max(0, tonumber(Config.Aim.PredictionTime) or 0)
+        point = point + clampPredictionOffset(offset)
+    end
+    return point
+end
+
+local function hasLineOfSight(character, point)
+    Camera = workspace.CurrentCamera or Camera
+    if not Camera or not character or typeof(point) ~= "Vector3" then
+        return false
+    end
+
+    local origin = Camera.CFrame.Position
+    local direction = point - origin
+    if direction.Magnitude <= 0.01 then
+        return true
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+
+    local filter = {}
+    if LocalPlayer.Character then
+        filter[#filter + 1] = LocalPlayer.Character
+    end
+    if workspace:FindFirstChild("Ignore") then
+        filter[#filter + 1] = workspace.Ignore
+    end
+    if Camera then
+        filter[#filter + 1] = Camera
+    end
+    params.FilterDescendantsInstances = filter
+
+    local result = workspace:Raycast(origin, direction, params)
+    return result == nil or (result.Instance and result.Instance:IsDescendantOf(character))
+end
+
+local function isVisible(character, point)
+    if not Config.Aim.VisibleCheck then
+        return true
+    end
+    return hasLineOfSight(character, point)
+end
+
+-- ESP visibility is intentionally independent from Aim.VisibleCheck.
+-- If ANY major body point has a clear camera ray, the enemy counts as visible.
+local function isCharacterVisible(character)
+    if not character then
+        return false
+    end
+
+    local priorityParts = {
+        "Head",
+        "Torso",
+        "UpperTorso",
+        "HumanoidRootPart",
+        "Left Arm",
+        "Right Arm",
+        "LeftUpperArm",
+        "RightUpperArm",
+    }
+
+    for _, name in ipairs(priorityParts) do
+        local part = character:FindFirstChild(name)
+        if part and part:IsA("BasePart") and hasLineOfSight(character, part.Position) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function targetStillValid(player, fovMultiplier)
+    if not player or not State.Alive then
+        return false, nil, nil
+    end
+    if not isEnemy(player, Config.Aim.TeamCheck) then
+        return false, nil, nil
+    end
+
+    local character, humanoid, root = getCharacterData(player)
+    if not character then
+        return false, nil, nil
+    end
+
+    Camera = workspace.CurrentCamera or Camera
+    if not Camera then
+        return false, nil, nil
+    end
+
+    local cameraPos = Camera.CFrame.Position
+    local distance3D = (root.Position - cameraPos).Magnitude
+    if distance3D > Config.Aim.MaxDistance then
+        return false, nil, nil
+    end
+
+    local screenOrigin = getAimOrigin2D()
+    local part = getTargetPart(character, screenOrigin)
+    if not part then
+        return false, nil, nil
+    end
+
+    local point = getPredictedPoint(part)
+    local screenPos, onScreen, depth = worldToScreen(point)
+    if not screenPos or depth <= 0 or not onScreen then
+        return false, nil, nil
+    end
+
+    local allowedFOV = Config.Aim.FOV * (fovMultiplier or 1)
+    if (screenPos - screenOrigin).Magnitude > allowedFOV then
+        return false, nil, nil
+    end
+
+    if not isVisible(character, point) then
+        return false, nil, nil
+    end
+
+    return true, part, point
+end
+
+local function selectBestTarget()
+    Camera = workspace.CurrentCamera or Camera
+    if not Camera then
+        State.CurrentTarget = nil
+        State.CurrentPart = nil
+        State.CurrentAimPoint = nil
+        return nil
+    end
+
+    if Config.Aim.StickyTarget and State.CurrentTarget then
+        local ok, part, point = targetStillValid(
+            State.CurrentTarget,
+            Config.Aim.StickyFOVMultiplier
+        )
+        if ok then
+            State.CurrentPart = part
+            State.CurrentAimPoint = point
+            return State.CurrentTarget, part, point
+        end
+    end
+
+    local screenOrigin = getAimOrigin2D()
+    local cameraPos = Camera.CFrame.Position
+    local bestPlayer = nil
+    local bestPart = nil
+    local bestPoint = nil
+    local bestScore = math.huge
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isEnemy(player, Config.Aim.TeamCheck) then
+            local character, humanoid, root = getCharacterData(player)
+            if character then
+                local distance3D = (root.Position - cameraPos).Magnitude
+                if distance3D <= Config.Aim.MaxDistance then
+                    local part = getTargetPart(character, screenOrigin)
+                    if part then
+                        local point = getPredictedPoint(part)
+                        local screenPos, onScreen, depth = worldToScreen(point)
+                        if screenPos and onScreen and depth > 0 then
+                            local screenDistance = (screenPos - screenOrigin).Magnitude
+                            if screenDistance <= Config.Aim.FOV then
+                                if isVisible(character, point) then
+                                    -- Screen distance is the primary metric; tiny distance
+                                    -- weighting breaks ties without pulling aim off-crosshair.
+                                    local score = screenDistance + (distance3D * 0.0005)
+                                    if score < bestScore then
+                                        bestScore = score
+                                        bestPlayer = player
+                                        bestPart = part
+                                        bestPoint = point
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    State.CurrentTarget = bestPlayer
+    State.CurrentPart = bestPart
+    State.CurrentAimPoint = bestPoint
+    return bestPlayer, bestPart, bestPoint
+end
+
+local function aimActivationHeld()
+    if not Config.Aim.Enabled then
+        return false
+    end
+
+    if not Config.Aim.HoldRMB then
+        return true
+    end
+
+    return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+end
+
+--// Game-specific ballistic alignment
+local function getTimeForDistance(speed, decay, distance)
+    speed = tonumber(speed) or 0
+    decay = math.max(0, tonumber(decay) or 0)
+    distance = math.max(0, tonumber(distance) or 0)
+
+    if distance <= 0 then
+        return 0
+    end
+    if speed <= 0.001 then
+        return nil
+    end
+
+    if decay > 0.000001 then
+        local maxForward = speed / decay
+        if distance >= maxForward then
+            return nil
+        end
+        local inside = 1 - (distance * decay / speed)
+        if inside <= 0 then
+            return nil
+        end
+        return -(1 / decay) * math.log(inside)
+    end
+
+    return distance / speed
+end
+
+local function getBallisticAimPoint(tool, muzzleIndex, bulletIndex, origin, targetPart)
+    local point = targetPart.Position
+    local manager = State.Ballistics.WeaponConfigManager
+    if not manager or not tool or typeof(tool) ~= "Instance" then
+        return getPredictedPoint(targetPart) or point
+    end
+
+    local ok, muzzleConfig = pcall(function()
+        return manager:GetMuzzleConfig(tool.Name, muzzleIndex or 1)
+    end)
+    if not ok or type(muzzleConfig) ~= "table" then
+        return getPredictedPoint(targetPart) or point
+    end
+
+    local bullets = muzzleConfig.BulletSettings
+    local bullet = type(bullets) == "table" and bullets[bulletIndex or 1] or nil
+    if type(bullet) ~= "table" then
+        return getPredictedPoint(targetPart) or point
+    end
+
+    local speed = tonumber(bullet.MuzzleVelocity) or 0
+    local decay = tonumber(bullet.Drag) or 0
+    if speed <= 0 then
+        return getPredictedPoint(targetPart) or point
+    end
+
+    local velocity = targetPart.AssemblyLinearVelocity or Vector3.new()
+    local solved = point
+
+    -- Two light iterations are enough because target lead/drop are small relative
+    -- to the total range. This mirrors the game's exponential forward decay.
+    for _ = 1, 2 do
+        local distance = (solved - origin).Magnitude
+        local travelTime = getTimeForDistance(speed, decay, distance)
+        if not travelTime then
+            break
+        end
+        travelTime = math.clamp(travelTime, 0, 3)
+
+        local lead = Vector3.new()
+        if Config.Aim.Prediction then
+            lead = velocity * travelTime
+            lead = clampPredictionOffset(lead)
+        end
+
+        local dropCompensation = Vector3.new()
+        if Config.Aim.BallisticCompensation then
+            dropCompensation = Vector3.new(0, 0.5 * workspace.Gravity * travelTime * travelTime, 0)
+        end
+
+        solved = point + lead + dropCompensation
+    end
+
+    return solved
+end
+
+local function rotateDirection(vector, fromDirection, toDirection)
+    if not vector or not fromDirection or not toDirection then
+        return vector
+    end
+
+    local from = fromDirection.Unit
+    local to = toDirection.Unit
+    local dot = math.clamp(from:Dot(to), -1, 1)
+
+    if dot > 0.999999 then
+        return vector
+    end
+
+    local axis = from:Cross(to)
+    if axis.Magnitude < 0.000001 then
+        axis = from:Cross(Vector3.new(0, 1, 0))
+        if axis.Magnitude < 0.000001 then
+            axis = from:Cross(Vector3.new(1, 0, 0))
+        end
+    end
+
+    if axis.Magnitude < 0.000001 then
+        return vector
+    end
+
+    local rotation = CFrame.fromAxisAngle(axis.Unit, math.acos(dot))
+    return rotation:VectorToWorldSpace(vector).Unit
+end
+
+local function installBallisticAlign()
+    if State.Ballistics.Installed or not State.Alive then
+        return State.Ballistics.Installed
+    end
+
+    local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    local ballisticsClient = playerScripts and playerScripts:FindFirstChild("BallisticsClient")
+    local clientFireModule = ballisticsClient and ballisticsClient:FindFirstChild("ClientFire")
+
+    if not clientFireModule or not clientFireModule:IsA("ModuleScript") then
+        return false
+    end
+
+    local okClientFire, ClientFire = pcall(require, clientFireModule)
+    if not okClientFire or type(ClientFire) ~= "table" or type(ClientFire.fireVolley) ~= "function" then
+        return false
+    end
+
+    local managerModule = ReplicatedStorage:FindFirstChild("Shared")
+    managerModule = managerModule and managerModule:FindFirstChild("WeaponConfigManager")
+    if managerModule and managerModule:IsA("ModuleScript") then
+        local okManager, manager = pcall(require, managerModule)
+        if okManager and type(manager) == "table" then
+            State.Ballistics.WeaponConfigManager = manager
+        end
+    end
+
+    local original = ClientFire.fireVolley
+    local wrapper
+
+    wrapper = function(tool, muzzleIndex, bulletIndex, origin, directions, options)
+        if State.Alive
+            and Config.Aim.Enabled
+            and Config.Aim.BallisticAlign
+            and aimActivationHeld()
+            and typeof(origin) == "Vector3"
+            and type(directions) == "table"
+            and #directions > 0 then
+
+            local player, part = selectBestTarget()
+            if player and part and part.Parent then
+                local desiredPoint = getBallisticAimPoint(
+                    tool,
+                    muzzleIndex,
+                    bulletIndex,
+                    origin,
+                    part
+                )
+
+                if desiredPoint then
+                    local delta = desiredPoint - origin
+                    if delta.Magnitude > 0.001 then
+                        local desiredDirection = delta.Unit
+                        local replacement = {}
+
+                        if Config.Aim.PreserveSpread then
+                            local average = Vector3.new()
+                            for i = 1, #directions do
+                                local direction = directions[i]
+                                if typeof(direction) == "Vector3" then
+                                    average = average + direction.Unit
+                                end
+                            end
+
+                            if average.Magnitude > 0.000001 then
+                                average = average.Unit
+                                for i = 1, #directions do
+                                    local direction = directions[i]
+                                    if typeof(direction) == "Vector3" then
+                                        replacement[i] = rotateDirection(direction, average, desiredDirection)
+                                    else
+                                        replacement[i] = direction
+                                    end
+                                end
+                            else
+                                for i = 1, #directions do
+                                    replacement[i] = desiredDirection
+                                end
+                            end
+                        else
+                            for i = 1, #directions do
+                                replacement[i] = desiredDirection
+                            end
+                        end
+
+                        directions = replacement
+                    end
+                end
+            end
+        end
+
+        return original(tool, muzzleIndex, bulletIndex, origin, directions, options)
+    end
+
+    ClientFire.fireVolley = wrapper
+    State.Ballistics.ClientFire = ClientFire
+    State.Ballistics.OriginalFireVolley = original
+    State.Ballistics.Wrapper = wrapper
+    State.Ballistics.Installed = true
+    return true
+end
+
+-- Retry while the character/player scripts are still loading.
+task.spawn(function()
+    while State.Alive and not State.Ballistics.Installed do
+        pcall(installBallisticAlign)
+        task.wait(1)
+    end
+end)
+
+--// Drawing ESP
+local DrawingAvailable = type(Drawing) == "table" and type(Drawing.new) == "function"
+
+local function newDrawing(kind)
+    if not DrawingAvailable then
+        return nil
+    end
+    local ok, object = pcall(Drawing.new, kind)
+    if not ok then
+        return nil
+    end
+    object.Visible = false
+    return object
+end
+
+local function createESP(player)
+    if State.Drawings[player] then
+        return State.Drawings[player]
+    end
+
+    local bundle = {
+        BoxOutline = newDrawing("Square"),
+        Box = newDrawing("Square"),
+        Name = newDrawing("Text"),
+        HealthText = newDrawing("Text"),
+        Distance = newDrawing("Text"),
+        Tracer = newDrawing("Line"),
+        HealthBack = newDrawing("Line"),
+        HealthBar = newDrawing("Line"),
+    }
+
+    if bundle.BoxOutline then
+        bundle.BoxOutline.Filled = false
+        bundle.BoxOutline.Thickness = 3
+        bundle.BoxOutline.Color = Color3.new(0, 0, 0)
+        bundle.BoxOutline.Transparency = 0.65
+    end
+
+    if bundle.Box then
+        bundle.Box.Filled = false
+        bundle.Box.Thickness = 1
+        bundle.Box.Color = Color3.fromRGB(255, 85, 85)
+        bundle.Box.Transparency = 1
+    end
+
+    for _, textObject in ipairs({bundle.Name, bundle.HealthText, bundle.Distance}) do
+        if textObject then
+            textObject.Size = 13
+            textObject.Center = true
+            textObject.Outline = true
+            textObject.Color = Color3.new(1, 1, 1)
+            textObject.Transparency = 1
+        end
+    end
+
+    if bundle.HealthText then
+        bundle.HealthText.Size = 12
+    end
+    if bundle.Distance then
+        bundle.Distance.Size = 12
+    end
+
+    if bundle.Tracer then
+        bundle.Tracer.Thickness = 1
+        bundle.Tracer.Color = Color3.fromRGB(255, 85, 85)
+        bundle.Tracer.Transparency = 0.9
+    end
+
+    if bundle.HealthBack then
+        bundle.HealthBack.Thickness = 4
+        bundle.HealthBack.Color = Color3.new(0, 0, 0)
+        bundle.HealthBack.Transparency = 0.75
+    end
+
+    if bundle.HealthBar then
+        bundle.HealthBar.Thickness = 2
+        bundle.HealthBar.Color = Color3.fromRGB(85, 255, 110)
+        bundle.HealthBar.Transparency = 1
+    end
+
+    State.Drawings[player] = bundle
+    return bundle
+end
+
+local function hideBundle(bundle)
+    if not bundle then
+        return
+    end
+    for _, object in pairs(bundle) do
+        if object then
+            pcall(function()
+                object.Visible = false
+            end)
+        end
+    end
+end
+
+local function getScreenBounds(character)
+    Camera = workspace.CurrentCamera or Camera
+    if not Camera then
+        return nil
+    end
+
+    local ok, boxCFrame, boxSize = pcall(function()
+        return character:GetBoundingBox()
+    end)
+    if not ok or not boxCFrame or not boxSize then
+        return nil
+    end
+
+    local half = boxSize * 0.5
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local pointsInFront = 0
+
+    for x = -1, 1, 2 do
+        for y = -1, 1, 2 do
+            for z = -1, 1, 2 do
+                local worldPoint = boxCFrame:PointToWorldSpace(Vector3.new(
+                    half.X * x,
+                    half.Y * y,
+                    half.Z * z
+                ))
+                local screenPoint = Camera:WorldToViewportPoint(worldPoint)
+                if screenPoint.Z > 0 then
+                    pointsInFront = pointsInFront + 1
+                    minX = math.min(minX, screenPoint.X)
+                    minY = math.min(minY, screenPoint.Y)
+                    maxX = math.max(maxX, screenPoint.X)
+                    maxY = math.max(maxY, screenPoint.Y)
+                end
+            end
+        end
+    end
+
+    if pointsInFront == 0 or minX == math.huge then
+        return nil
+    end
+
+    return Vector2.new(minX, minY), Vector2.new(maxX, maxY)
+end
+
+local ESP_OCCLUDED_COLOR = Color3.fromRGB(255, 85, 85)
+local ESP_VISIBLE_COLOR = Color3.fromRGB(80, 255, 120)
+local ESP_OCCLUDED_OUTLINE = Color3.fromRGB(255, 220, 220)
+local ESP_VISIBLE_OUTLINE = Color3.fromRGB(205, 255, 215)
+
+local function updateHighlight(player, character, onScreen, lineOfSight)
+    if not Config.ESP.Chams or not onScreen then
+        destroyHighlight(player)
+        return
+    end
+
+    local highlight = State.Highlights[player]
+    if not highlight or not highlight.Parent then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "PuckAFK_ColdWar_ESP"
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.FillTransparency = 0.72
+        highlight.OutlineTransparency = 0.12
+        highlight.FillColor = ESP_OCCLUDED_COLOR
+        highlight.OutlineColor = ESP_OCCLUDED_OUTLINE
+        highlight.Parent = workspace.CurrentCamera or workspace
+        State.Highlights[player] = highlight
+    end
+
+    local visibleColoring = Config.ESP.VisibleGreen and lineOfSight
+    highlight.FillColor = visibleColoring and ESP_VISIBLE_COLOR or ESP_OCCLUDED_COLOR
+    highlight.OutlineColor = visibleColoring and ESP_VISIBLE_OUTLINE or ESP_OCCLUDED_OUTLINE
+    highlight.Adornee = character
+    highlight.Enabled = true
+end
+
+local function updatePlayerESP(player)
+    local bundle = createESP(player)
+
+    if not Config.ESP.Enabled or not isEnemy(player, Config.ESP.TeamCheck) then
+        hideBundle(bundle)
+        destroyHighlight(player)
+        return
+    end
+
+    local character, humanoid, root = getCharacterData(player)
+    if not character then
+        hideBundle(bundle)
+        destroyHighlight(player)
+        return
+    end
+
+    Camera = workspace.CurrentCamera or Camera
+    if not Camera then
+        hideBundle(bundle)
+        destroyHighlight(player)
+        return
+    end
+
+    local distance = (root.Position - Camera.CFrame.Position).Magnitude
+    if distance > Config.ESP.MaxDistance then
+        hideBundle(bundle)
+        destroyHighlight(player)
+        return
+    end
+
+    local rootScreen, rootOnScreen, rootDepth = worldToScreen(root.Position)
+    local onScreen = rootScreen ~= nil and rootDepth > 0 and rootOnScreen
+    local lineOfSight = isCharacterVisible(character)
+    local visibleColoring = Config.ESP.VisibleGreen and lineOfSight
+    local espColor = visibleColoring and ESP_VISIBLE_COLOR or ESP_OCCLUDED_COLOR
+    updateHighlight(player, character, onScreen or rootDepth > 0, lineOfSight)
+
+    local topLeft, bottomRight = getScreenBounds(character)
+    if not topLeft or not bottomRight then
+        hideBundle(bundle)
+        return
+    end
+
+    local size = bottomRight - topLeft
+    if size.X < 2 or size.Y < 2 then
+        hideBundle(bundle)
+        return
+    end
+
+    local centerX = topLeft.X + size.X * 0.5
+    local healthRatio = 0
+    if humanoid.MaxHealth > 0 then
+        healthRatio = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+    end
+
+    local healthColor = Color3.new(1 - healthRatio, healthRatio, 0)
+
+    -- Visible enemies are green; enemies behind geometry stay red.
+    if bundle.Box then
+        bundle.Box.Color = espColor
+    end
+    if bundle.Name then
+        bundle.Name.Color = espColor
+    end
+    if bundle.Distance then
+        bundle.Distance.Color = espColor
+    end
+    if bundle.Tracer then
+        bundle.Tracer.Color = espColor
+    end
+
+    if bundle.BoxOutline then
+        bundle.BoxOutline.Visible = Config.ESP.Boxes
+        bundle.BoxOutline.Position = topLeft
+        bundle.BoxOutline.Size = size
+    end
+    if bundle.Box then
+        bundle.Box.Visible = Config.ESP.Boxes
+        bundle.Box.Position = topLeft
+        bundle.Box.Size = size
+    end
+
+    if bundle.Name then
+        bundle.Name.Visible = Config.ESP.Names
+        bundle.Name.Text = player.DisplayName ~= player.Name
+            and (player.DisplayName .. " [" .. player.Name .. "]")
+            or player.Name
+        bundle.Name.Position = Vector2.new(centerX, topLeft.Y - 16)
+    end
+
+    if bundle.HealthText then
+        bundle.HealthText.Visible = Config.ESP.Health
+        bundle.HealthText.Text = tostring(math.floor(humanoid.Health + 0.5)) .. " HP"
+        bundle.HealthText.Color = healthColor
+        bundle.HealthText.Position = Vector2.new(centerX, bottomRight.Y + 3)
+    end
+
+    if bundle.Distance then
+        bundle.Distance.Visible = Config.ESP.Distance
+        bundle.Distance.Text = tostring(math.floor(distance + 0.5)) .. " studs"
+        bundle.Distance.Position = Vector2.new(centerX, bottomRight.Y + (Config.ESP.Health and 17 or 3))
+    end
+
+    local healthX = topLeft.X - 5
+    if bundle.HealthBack then
+        bundle.HealthBack.Visible = Config.ESP.Health
+        bundle.HealthBack.From = Vector2.new(healthX, bottomRight.Y)
+        bundle.HealthBack.To = Vector2.new(healthX, topLeft.Y)
+    end
+    if bundle.HealthBar then
+        bundle.HealthBar.Visible = Config.ESP.Health
+        bundle.HealthBar.Color = healthColor
+        bundle.HealthBar.From = Vector2.new(healthX, bottomRight.Y)
+        bundle.HealthBar.To = Vector2.new(
+            healthX,
+            bottomRight.Y - (size.Y * healthRatio)
+        )
+    end
+
+    if bundle.Tracer then
+        bundle.Tracer.Visible = Config.ESP.Tracers
+        bundle.Tracer.From = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y - 2)
+        bundle.Tracer.To = Vector2.new(centerX, bottomRight.Y)
+    end
+end
+
+--// FOV circle
+local FOVCircle = newDrawing("Circle")
+if FOVCircle then
+    FOVCircle.Filled = false
+    FOVCircle.Thickness = 1
+    FOVCircle.NumSides = 96
+    FOVCircle.Color = Color3.fromRGB(235, 235, 235)
+    FOVCircle.Transparency = 0.75
+end
+
+--// PuckUI
+local Window = PuckUI:CreateWindow({
+    Name = "PuckAFK · Cold War",
+    GuiName = "PuckAFK_ColdWar_AimESP",
+    ConfigId = "ColdWarAimESP",
+    Width = 500,
+    Height = 560,
+})
+
+local AimTab = Window:CreateTab("Aim")
+AimTab:CreateSection("Targeting")
+
+AimTab:CreateToggle({
+    Name = "Enable Aim",
+    ConfigKey = "Aim.Enabled",
+    CurrentValue = Config.Aim.Enabled,
+    Callback = function(value)
+        Config.Aim.Enabled = value == true
+        if not Config.Aim.Enabled then
+            State.CurrentTarget = nil
+            State.CurrentPart = nil
+            State.CurrentAimPoint = nil
+        end
+    end,
+})
+
+AimTab:CreateToggle({
+    Name = "Hold RMB",
+    ConfigKey = "Aim.HoldRMB",
+    CurrentValue = Config.Aim.HoldRMB,
+    Callback = function(value)
+        Config.Aim.HoldRMB = value == true
+    end,
+})
+
+AimTab:CreateToggle({
+    Name = "Team Check",
+    ConfigKey = "Aim.TeamCheck",
+    CurrentValue = Config.Aim.TeamCheck,
+    Callback = function(value)
+        Config.Aim.TeamCheck = value == true
+    end,
+})
+
+AimTab:CreateToggle({
+    Name = "Visible Check",
+    ConfigKey = "Aim.VisibleCheck",
+    CurrentValue = Config.Aim.VisibleCheck,
+    Callback = function(value)
+        Config.Aim.VisibleCheck = value == true
+    end,
+})
+
+AimTab:CreateDropdown({
+    Name = "Aim Point",
+    ConfigKey = "Aim.AimPoint",
+    Options = {"Head", "Torso", "Closest Part"},
+    CurrentOption = {Config.Aim.AimPoint},
+    Callback = function(value)
+        Config.Aim.AimPoint = tostring(normalizeDropdown(value) or "Head")
+    end,
+})
+
+AimTab:CreateSlider({
+    Name = "FOV",
+    ConfigKey = "Aim.FOV",
+    Range = {30, 700},
+    Increment = 5,
+    CurrentValue = Config.Aim.FOV,
+    Suffix = " px",
+    Callback = function(value)
+        Config.Aim.FOV = tonumber(value) or Config.Aim.FOV
+    end,
+})
+
+AimTab:CreateSlider({
+    Name = "Aim Speed",
+    ConfigKey = "Aim.AimSpeed",
+    Range = {1, 80},
+    Increment = 1,
+    CurrentValue = Config.Aim.AimSpeed,
+    Callback = function(value)
+        Config.Aim.AimSpeed = tonumber(value) or Config.Aim.AimSpeed
+    end,
+})
+
+AimTab:CreateSlider({
+    Name = "Max Distance",
+    ConfigKey = "Aim.MaxDistance",
+    Range = {100, 5000},
+    Increment = 50,
+    CurrentValue = Config.Aim.MaxDistance,
+    Suffix = " studs",
+    Callback = function(value)
+        Config.Aim.MaxDistance = tonumber(value) or Config.Aim.MaxDistance
+    end,
+})
+
+AimTab:CreateSection("Tracking")
+
+AimTab:CreateToggle({
+    Name = "Sticky Target",
+    ConfigKey = "Aim.StickyTarget",
+    CurrentValue = Config.Aim.StickyTarget,
+    Callback = function(value)
+        Config.Aim.StickyTarget = value == true
+    end,
+})
+
+AimTab:CreateToggle({
+    Name = "Prediction",
+    ConfigKey = "Aim.Prediction",
+    CurrentValue = Config.Aim.Prediction,
+    Callback = function(value)
+        Config.Aim.Prediction = value == true
+    end,
+})
+
+AimTab:CreateSlider({
+    Name = "Prediction Time",
+    ConfigKey = "Aim.PredictionTimeMs",
+    Range = {0, 200},
+    Increment = 5,
+    CurrentValue = math.floor(Config.Aim.PredictionTime * 1000 + 0.5),
+    Suffix = " ms",
+    Callback = function(value)
+        Config.Aim.PredictionTime = (tonumber(value) or 0) / 1000
+    end,
+})
+
+AimTab:CreateToggle({
+    Name = "Show FOV",
+    ConfigKey = "Aim.ShowFOV",
+    CurrentValue = Config.Aim.ShowFOV,
+    Callback = function(value)
+        Config.Aim.ShowFOV = value == true
+    end,
+})
+
+AimTab:CreateSection("Ballistics")
+
+AimTab:CreateToggle({
+    Name = "Ballistic Align",
+    ConfigKey = "Aim.BallisticAlign",
+    CurrentValue = Config.Aim.BallisticAlign,
+    Callback = function(value)
+        Config.Aim.BallisticAlign = value == true
+        if Config.Aim.BallisticAlign and not State.Ballistics.Installed then
+            pcall(installBallisticAlign)
+        end
+    end,
+})
+
+AimTab:CreateToggle({
+    Name = "Bullet Drop Compensation",
+    ConfigKey = "Aim.BallisticCompensation",
+    CurrentValue = Config.Aim.BallisticCompensation,
+    Callback = function(value)
+        Config.Aim.BallisticCompensation = value == true
+    end,
+})
+
+AimTab:CreateToggle({
+    Name = "Preserve Weapon Spread",
+    ConfigKey = "Aim.PreserveSpread",
+    CurrentValue = Config.Aim.PreserveSpread,
+    Callback = function(value)
+        Config.Aim.PreserveSpread = value == true
+    end,
+})
+
+local AimStatus = AimTab:CreateLabel("Target: none")
+local BallisticStatus = AimTab:CreateLabel("Ballistics: waiting for PlayerScripts...")
+
+local ESPTab = Window:CreateTab("ESP")
+ESPTab:CreateSection("Visuals")
+
+ESPTab:CreateToggle({
+    Name = "Enable ESP",
+    ConfigKey = "ESP.Enabled",
+    CurrentValue = Config.ESP.Enabled,
+    Callback = function(value)
+        Config.ESP.Enabled = value == true
+    end,
+})
+
+ESPTab:CreateToggle({
+    Name = "Boxes",
+    ConfigKey = "ESP.Boxes",
+    CurrentValue = Config.ESP.Boxes,
+    Callback = function(value)
+        Config.ESP.Boxes = value == true
+    end,
+})
+
+ESPTab:CreateToggle({
+    Name = "Names",
+    ConfigKey = "ESP.Names",
+    CurrentValue = Config.ESP.Names,
+    Callback = function(value)
+        Config.ESP.Names = value == true
+    end,
+})
+
+ESPTab:CreateToggle({
+    Name = "Health",
+    ConfigKey = "ESP.Health",
+    CurrentValue = Config.ESP.Health,
+    Callback = function(value)
+        Config.ESP.Health = value == true
+    end,
+})
+
+ESPTab:CreateToggle({
+    Name = "Distance",
+    ConfigKey = "ESP.Distance",
+    CurrentValue = Config.ESP.Distance,
+    Callback = function(value)
+        Config.ESP.Distance = value == true
+    end,
+})
+
+ESPTab:CreateToggle({
+    Name = "Tracers",
+    ConfigKey = "ESP.Tracers",
+    CurrentValue = Config.ESP.Tracers,
+    Callback = function(value)
+        Config.ESP.Tracers = value == true
+    end,
+})
+
+ESPTab:CreateToggle({
+    Name = "Chams",
+    ConfigKey = "ESP.Chams",
+    CurrentValue = Config.ESP.Chams,
+    Callback = function(value)
+        Config.ESP.Chams = value == true
+        if not Config.ESP.Chams then
+            for player in pairs(State.Highlights) do
+                destroyHighlight(player)
+            end
+        end
+    end,
+})
+
+ESPTab:CreateToggle({
+    Name = "Visible Enemies = Green",
+    ConfigKey = "ESP.VisibleGreen",
+    CurrentValue = Config.ESP.VisibleGreen,
+    Callback = function(value)
+        Config.ESP.VisibleGreen = value == true
+    end,
+})
+
+ESPTab:CreateSection("Filtering")
+
+ESPTab:CreateToggle({
+    Name = "Team Check",
+    ConfigKey = "ESP.TeamCheck",
+    CurrentValue = Config.ESP.TeamCheck,
+    Callback = function(value)
+        Config.ESP.TeamCheck = value == true
+    end,
+})
+
+ESPTab:CreateSlider({
+    Name = "Max Distance",
+    ConfigKey = "ESP.MaxDistance",
+    Range = {100, 6000},
+    Increment = 50,
+    CurrentValue = Config.ESP.MaxDistance,
+    Suffix = " studs",
+    Callback = function(value)
+        Config.ESP.MaxDistance = tonumber(value) or Config.ESP.MaxDistance
+    end,
+})
+
+local ESPStatus = ESPTab:CreateLabel(
+    DrawingAvailable and "Drawing ESP: ready" or "Drawing ESP unavailable; chams still work"
+)
+
+local SettingsTab = Window:CreateTab("Settings")
+SettingsTab:CreateSection("Script")
+SettingsTab:CreateParagraph({
+    Title = "Cold War backend",
+    Content = "Aim runs after the game's recoil camera step and before late weapon/viewmodel rendering. Ballistic Align is optional and targets the game's ClientFire projectile directions.",
+    Height = 72,
+})
+
+local function cleanup(destroyWindow)
+    if not State.Alive then
+        return
+    end
+    State.Alive = false
+
+    pcall(function()
+        RunService:UnbindFromRenderStep("PuckAFK_ColdWar_Aim")
+    end)
+
+    if State.Ballistics.Installed
+        and State.Ballistics.ClientFire
+        and State.Ballistics.OriginalFireVolley
+        and State.Ballistics.ClientFire.fireVolley == State.Ballistics.Wrapper then
+        pcall(function()
+            State.Ballistics.ClientFire.fireVolley = State.Ballistics.OriginalFireVolley
+        end)
+    end
+
+    for _, connection in ipairs(State.Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    State.Connections = {}
+
+    local drawingPlayers = {}
+    for player in pairs(State.Drawings) do
+        drawingPlayers[#drawingPlayers + 1] = player
+    end
+    for _, player in ipairs(drawingPlayers) do
+        destroyESP(player)
+    end
+
+    local highlightedPlayers = {}
+    for player in pairs(State.Highlights) do
+        highlightedPlayers[#highlightedPlayers + 1] = player
+    end
+    for _, player in ipairs(highlightedPlayers) do
+        destroyHighlight(player)
+    end
+
+    safeRemoveDrawing(FOVCircle)
+
+    ENV.__PUCKAFK_COLDWAR_AIM_ESP_CLEANUP = nil
+
+    if destroyWindow ~= false and Window then
+        pcall(function()
+            Window:Destroy()
+        end)
+    end
+end
+
+ENV.__PUCKAFK_COLDWAR_AIM_ESP_CLEANUP = function()
+    cleanup(true)
+end
+
+SettingsTab:CreateButton({
+    Name = "Unload Script",
+    Callback = function()
+        cleanup(true)
+    end,
+})
+
+Window:SetCloseCallback(function()
+    cleanup(true)
+end)
+
+-- Player lifecycle cleanup
+connect(Players.PlayerRemoving, function(player)
+    if State.CurrentTarget == player then
+        State.CurrentTarget = nil
+        State.CurrentPart = nil
+        State.CurrentAimPoint = nil
+    end
+    destroyESP(player)
+end)
+
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+    Camera = workspace.CurrentCamera
+    for _, highlight in pairs(State.Highlights) do
+        if highlight and Camera then
+            pcall(function()
+                highlight.Parent = Camera
+            end)
+        end
+    end
+end)
+
+-- Camera aim: the inspected game applies recoil at Camera + 1, so +2 lets us
+-- correct the final camera while still leaving late weapon/viewmodel logic time
+-- to consume that corrected orientation before a shot.
+RunService:BindToRenderStep(
+    "PuckAFK_ColdWar_Aim",
+    Enum.RenderPriority.Camera.Value + 2,
+    function(dt)
+        if not State.Alive then
+            return
+        end
+
+        Camera = workspace.CurrentCamera or Camera
+        if not Camera then
+            return
+        end
+
+        if FOVCircle then
+            FOVCircle.Visible = Config.Aim.Enabled and Config.Aim.ShowFOV
+            FOVCircle.Position = getAimOrigin2D()
+            FOVCircle.Radius = Config.Aim.FOV
+        end
+
+        if not aimActivationHeld() then
+            State.CurrentTarget = nil
+            State.CurrentPart = nil
+            State.CurrentAimPoint = nil
+            return
+        end
+
+        local player, part, point = selectBestTarget()
+        if not player or not part or not point then
+            return
+        end
+
+        local cameraPosition = Camera.CFrame.Position
+        local delta = point - cameraPosition
+        if delta.Magnitude <= 0.001 then
+            return
+        end
+
+        local desired = CFrame.lookAt(cameraPosition, point, Camera.CFrame.UpVector)
+        local speed = math.max(1, tonumber(Config.Aim.AimSpeed) or 1)
+        local alpha = 1 - math.exp(-speed * math.max(dt, 0))
+        Camera.CFrame = Camera.CFrame:Lerp(desired, math.clamp(alpha, 0, 1))
+    end
+)
+
+-- ESP render pass
+connect(RunService.RenderStepped, function()
+    if not State.Alive then
+        return
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            updatePlayerESP(player)
+        end
+    end
+end)
+
+-- Lightweight status updater
+task.spawn(function()
+    while State.Alive do
+        local target = State.CurrentTarget
+        if AimStatus and AimStatus.Set then
+            if target and State.CurrentPart then
+                AimStatus:Set(
+                    "Target: " .. target.Name .. " · " .. State.CurrentPart.Name
+                )
+            else
+                AimStatus:Set("Target: none")
+            end
+        end
+
+        if BallisticStatus and BallisticStatus.Set then
+            BallisticStatus:Set(
+                State.Ballistics.Installed
+                    and (Config.Aim.BallisticAlign and "Ballistics: align ON" or "Ballistics: hook ready")
+                    or "Ballistics: waiting for PlayerScripts..."
+            )
+        end
+
+        if ESPStatus and ESPStatus.Set then
+            local enemies = 0
+            for _, player in ipairs(Players:GetPlayers()) do
+                if isEnemy(player, Config.ESP.TeamCheck) then
+                    local character = getCharacterData(player)
+                    if character then
+                        enemies = enemies + 1
+                    end
+                end
+            end
+            ESPStatus:Set(
+                (DrawingAvailable and "Drawing ESP ready" or "Drawing unavailable")
+                    .. " · enemies: " .. tostring(enemies)
+            )
+        end
+
+        task.wait(0.35)
+    end
+end)
+
+PuckUI:Notify({
+    Title = "Cold War",
+    Content = "Aim + ESP loaded. Visible enemies turn green; occluded enemies stay red. Hold RMB to aim.",
+    Duration = 4,
+})
