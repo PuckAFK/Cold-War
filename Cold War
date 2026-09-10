@@ -1,19 +1,23 @@
 --[[
     PuckAFK Hub · Cold War
-    Aim + ESP · Shared PuckUI
+    Aim + Silent Aim + ESP · Shared PuckUI
 
-    Built from the inspected place 13687899540 dump.
+    Built for PlaceId 13687899540 and refreshed against the supplied
+    Cold War WEATHER / MINIMAP place dump.
 
-    Game-specific findings used here:
-      • Standard Player.Character models with Humanoid + HumanoidRootPart
-      • R6-style combat body parts: Head, Torso, Left/Right Arm, Left/Right Leg
-      • Teams: PACT / NATO / Neutral
-      • Custom camera controller updates at RenderPriority.Camera
-      • Recoil updates at RenderPriority.Camera + 1
-      • Weapon firing uses the viewmodel muzzle + BallisticsClient
+    Game-specific backend used by this build:
+      • Combat teams: PACT / NATO / Neutral
+      • R6 combat characters with R15 fallbacks
+      • Camera update at RenderPriority.Camera
+      • Camera recoil at RenderPriority.Camera + 1
+      • Weather screen effects at RenderPriority.Camera + 2
+      • Weapon fire through PlayerScripts.BallisticsClient.ClientFire.fireVolley
+      • Projectile profiles from ReplicatedStorage.Shared.WeaponConfigManager
 
-    Aim is therefore applied at Camera + 2 so the weapon/viewmodel can consume
-    the corrected camera before late-render weapon/crosshair work.
+    Normal aimbot and silent aim are intentionally independent:
+      • Aimbot rotates the camera only while its own toggle/activation is active.
+      • Silent Aim redirects outgoing ClientFire projectile directions only while
+        its own toggle/activation is active and never needs the camera aimbot.
 ]]
 
 local compiler = loadstring or load
@@ -24,7 +28,6 @@ end
 local okUI, uiSource = pcall(function()
     return game:HttpGet("https://raw.githubusercontent.com/PuckAFK/Puck-Loader/main/ui/PuckUI.lua")
 end)
-
 if not okUI or type(uiSource) ~= "string" or #uiSource < 100 then
     return warn("[PuckAFK Cold War] failed to download shared PuckUI")
 end
@@ -55,34 +58,41 @@ local Camera = workspace.CurrentCamera
 
 local KNOWN_PLACE_ID = 13687899540
 if game.PlaceId ~= KNOWN_PLACE_ID then
-    warn(("[PuckAFK Cold War] Dump target was PlaceId %d; current PlaceId is %s. Continuing for same-game/subplace compatibility.")
+    warn(("[PuckAFK Cold War] Built for PlaceId %d; current PlaceId is %s. Continuing for same-game/subplace compatibility.")
         :format(KNOWN_PLACE_ID, tostring(game.PlaceId)))
 end
 
 --// Configuration
+-- ConfigKey names intentionally keep the old Aim.Enabled / Aim.BallisticAlign
+-- keys for profile compatibility while the UI now calls them Aimbot / Silent Aim.
 local Config = {
     Aim = {
-        Enabled = true,
+        Aimbot = true,
+        SilentAim = false,
         HoldRMB = true,
+        SilentAimHoldRMB = false,
+
         TeamCheck = true,
         VisibleCheck = true,
-        AimPoint = "Head", -- Head / Torso / Closest Part
-        FOV = 220,
-        AimSpeed = 30,
+        AimPoint = "Head", -- Head / Upper Torso / Closest Part
+        AimbotFOV = 220,
+        SilentAimFOV = 260,
         MaxDistance = 1800,
+
+        AimSpeed = 30,
         StickyTarget = true,
         StickyFOVMultiplier = 1.30,
+
         Prediction = true,
         PredictionTime = 0.055,
+        PredictionSmoothing = 65, -- 0 = raw velocity, 95 = very smooth
         MaxPredictionOffset = 18,
-        ShowFOV = true,
 
-        -- Game-specific fallback/accuracy layer. Camera aim should already feed
-        -- the viewmodel because we run at Camera + 2. Ballistic Align additionally
-        -- redirects ClientFire's outgoing projectile direction at the selected target.
-        BallisticAlign = false,
-        BallisticCompensation = true,
-        PreserveSpread = false,
+        ShowAimbotFOV = true,
+        ShowSilentAimFOV = false,
+
+        BulletDropCompensation = true,
+        PreserveSpread = true,
     },
 
     ESP = {
@@ -96,17 +106,29 @@ local Config = {
         Chams = true,
         VisibleGreen = true,
         MaxDistance = 2500,
+        VisibilityRefresh = 0.10,
     },
 }
 
+local function newTargetState()
+    return {
+        Player = nil,
+        Part = nil,
+        Point = nil,
+    }
+end
+
 local State = {
     Alive = true,
-    CurrentTarget = nil,
-    CurrentPart = nil,
-    CurrentAimPoint = nil,
     Connections = {},
     Drawings = {},
     Highlights = {},
+    VelocitySamples = setmetatable({}, {__mode = "k"}),
+    ESPVisibility = {},
+    Targets = {
+        Aimbot = newTargetState(),
+        SilentAim = newTargetState(),
+    },
     Ballistics = {
         Installed = false,
         ClientFire = nil,
@@ -116,7 +138,7 @@ local State = {
     },
 }
 
---// Helpers
+--// General helpers
 local function connect(signal, callback)
     local connection = signal:Connect(callback)
     State.Connections[#State.Connections + 1] = connection
@@ -128,6 +150,21 @@ local function normalizeDropdown(value)
         return value[1]
     end
     return value
+end
+
+local function clearTarget(mode)
+    local target = State.Targets[mode]
+    if not target then
+        return
+    end
+    target.Player = nil
+    target.Part = nil
+    target.Point = nil
+end
+
+local function clearAllTargets()
+    clearTarget("Aimbot")
+    clearTarget("SilentAim")
 end
 
 local function safeRemoveDrawing(object)
@@ -158,6 +195,7 @@ local function destroyESP(player)
             safeRemoveDrawing(object)
         end
     end
+    State.ESPVisibility[player] = nil
     destroyHighlight(player)
 end
 
@@ -180,20 +218,42 @@ local function getCharacterData(player)
     return character, humanoid, root
 end
 
-local function sameTeam(player)
-    local localTeam = LocalPlayer.Team
-    local otherTeam = player and player.Team
-    return localTeam ~= nil and otherTeam ~= nil and localTeam == otherTeam
+local COMBAT_TEAMS = {
+    NATO = true,
+    PACT = true,
+}
+
+local function teamName(player)
+    local team = player and player.Team
+    return team and tostring(team.Name) or ""
 end
 
 local function isEnemy(player, teamCheck)
     if not player or player == LocalPlayer then
         return false
     end
-    if teamCheck and sameTeam(player) then
-        return false
+    if not teamCheck then
+        return true
     end
-    return true
+
+    local localName = teamName(LocalPlayer)
+    local otherName = teamName(player)
+
+    -- Cold War uses NATO / PACT as combat teams and Neutral for non-combat.
+    -- Never treat Neutral players as enemy combatants when team filtering is on.
+    if COMBAT_TEAMS[localName] then
+        return COMBAT_TEAMS[otherName] == true and otherName ~= localName
+    end
+
+    -- While the local player is Neutral/spectating, both real combat teams can
+    -- still be visualized/selected without targeting other Neutral players.
+    if localName == "Neutral" or localName == "" then
+        return COMBAT_TEAMS[otherName] == true
+    end
+
+    local localTeam = LocalPlayer.Team
+    local otherTeam = player.Team
+    return localTeam ~= nil and otherTeam ~= nil and localTeam ~= otherTeam
 end
 
 local function getAimOrigin2D()
@@ -221,6 +281,8 @@ local function worldToScreen(position)
     return Vector2.new(point.X, point.Y), onScreen, point.Z
 end
 
+-- R6 is the live game format; the extra names make the script resilient if a
+-- character or subplace ever supplies an R15-style rig.
 local BODY_PART_NAMES = {
     "Head",
     "Torso",
@@ -229,7 +291,6 @@ local BODY_PART_NAMES = {
     "Right Arm",
     "Left Leg",
     "Right Leg",
-    -- fallback support if the live game ever changes rigs
     "UpperTorso",
     "LowerTorso",
     "LeftUpperArm",
@@ -238,35 +299,42 @@ local BODY_PART_NAMES = {
     "RightUpperLeg",
 }
 
-local function getClosestBodyPart(character, screenOrigin)
-    local bestPart = nil
-    local bestDistance = math.huge
+local VISIBILITY_PART_NAMES = {
+    "Head",
+    "Torso",
+    "UpperTorso",
+    "HumanoidRootPart",
+    "Left Arm",
+    "Right Arm",
+    "LeftUpperArm",
+    "RightUpperArm",
+}
 
-    for _, name in ipairs(BODY_PART_NAMES) do
-        local part = character:FindFirstChild(name)
-        if part and part:IsA("BasePart") then
-            local screenPos, _, depth = worldToScreen(part.Position)
-            if screenPos and depth > 0 then
-                local distance = (screenPos - screenOrigin).Magnitude
-                if distance < bestDistance then
-                    bestDistance = distance
-                    bestPart = part
-                end
-            end
-        end
-    end
-
-    return bestPart
-end
-
-local function getTargetPart(character, screenOrigin)
+local function getPreferredTargetPart(character, screenOrigin)
     local mode = Config.Aim.AimPoint
 
     if mode == "Closest Part" then
-        return getClosestBodyPart(character, screenOrigin)
+        local bestPart = nil
+        local bestDistance = math.huge
+
+        for _, name in ipairs(BODY_PART_NAMES) do
+            local part = character:FindFirstChild(name)
+            if part and part:IsA("BasePart") then
+                local screenPos, onScreen, depth = worldToScreen(part.Position)
+                if screenPos and onScreen and depth > 0 then
+                    local distance = (screenPos - screenOrigin).Magnitude
+                    if distance < bestDistance then
+                        bestDistance = distance
+                        bestPart = part
+                    end
+                end
+            end
+        end
+
+        return bestPart
     end
 
-    if mode == "Torso" then
+    if mode == "Upper Torso" or mode == "Torso" then
         return character:FindFirstChild("Torso")
             or character:FindFirstChild("UpperTorso")
             or character:FindFirstChild("HumanoidRootPart")
@@ -279,40 +347,7 @@ local function getTargetPart(character, screenOrigin)
         or character:FindFirstChild("HumanoidRootPart")
 end
 
-local function clampPredictionOffset(offset)
-    local maxOffset = math.max(0, tonumber(Config.Aim.MaxPredictionOffset) or 0)
-    if maxOffset > 0 and offset.Magnitude > maxOffset then
-        return offset.Unit * maxOffset
-    end
-    return offset
-end
-
-local function getPredictedPoint(part)
-    if not part or not part:IsA("BasePart") then
-        return nil
-    end
-
-    local point = part.Position
-    if Config.Aim.Prediction then
-        local velocity = part.AssemblyLinearVelocity or Vector3.new()
-        local offset = velocity * math.max(0, tonumber(Config.Aim.PredictionTime) or 0)
-        point = point + clampPredictionOffset(offset)
-    end
-    return point
-end
-
-local function hasLineOfSight(character, point)
-    Camera = workspace.CurrentCamera or Camera
-    if not Camera or not character or typeof(point) ~= "Vector3" then
-        return false
-    end
-
-    local origin = Camera.CFrame.Position
-    local direction = point - origin
-    if direction.Magnitude <= 0.01 then
-        return true
-    end
-
+local function makeVisibilityParams()
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.IgnoreWater = true
@@ -321,62 +356,139 @@ local function hasLineOfSight(character, point)
     if LocalPlayer.Character then
         filter[#filter + 1] = LocalPlayer.Character
     end
-    if workspace:FindFirstChild("Ignore") then
-        filter[#filter + 1] = workspace.Ignore
-    end
     if Camera then
         filter[#filter + 1] = Camera
     end
-    params.FilterDescendantsInstances = filter
-
-    local result = workspace:Raycast(origin, direction, params)
-    return result == nil or (result.Instance and result.Instance:IsDescendantOf(character))
-end
-
-local function isVisible(character, point)
-    if not Config.Aim.VisibleCheck then
-        return true
+    local ignore = workspace:FindFirstChild("Ignore")
+    if ignore then
+        filter[#filter + 1] = ignore
     end
-    return hasLineOfSight(character, point)
+
+    params.FilterDescendantsInstances = filter
+    return params
 end
 
--- ESP visibility is intentionally independent from Aim.VisibleCheck.
--- If ANY major body point has a clear camera ray, the enemy counts as visible.
-local function isCharacterVisible(character)
-    if not character then
+local function hasLineOfSightFrom(origin, character, point)
+    if typeof(origin) ~= "Vector3" or not character or typeof(point) ~= "Vector3" then
         return false
     end
 
-    local priorityParts = {
-        "Head",
-        "Torso",
-        "UpperTorso",
-        "HumanoidRootPart",
-        "Left Arm",
-        "Right Arm",
-        "LeftUpperArm",
-        "RightUpperArm",
-    }
+    local direction = point - origin
+    if direction.Magnitude <= 0.01 then
+        return true
+    end
 
-    for _, name in ipairs(priorityParts) do
+    local result = workspace:Raycast(origin, direction, makeVisibilityParams())
+    return result == nil
+        or (result.Instance and result.Instance:IsDescendantOf(character))
+end
+
+local function cameraHasLineOfSight(character, point)
+    Camera = workspace.CurrentCamera or Camera
+    return Camera ~= nil and hasLineOfSightFrom(Camera.CFrame.Position, character, point)
+end
+
+local function getClosestVisibleBodyPart(character, screenOrigin, sourcePosition)
+    local choices = {}
+
+    for _, name in ipairs(BODY_PART_NAMES) do
         local part = character:FindFirstChild(name)
-        if part and part:IsA("BasePart") and hasLineOfSight(character, part.Position) then
-            return true
+        if part and part:IsA("BasePart") then
+            local screenPos, onScreen, depth = worldToScreen(part.Position)
+            if screenPos and onScreen and depth > 0 then
+                choices[#choices + 1] = {
+                    Part = part,
+                    ScreenDistance = (screenPos - screenOrigin).Magnitude,
+                }
+            end
         end
     end
 
-    return false
+    table.sort(choices, function(a, b)
+        return a.ScreenDistance < b.ScreenDistance
+    end)
+
+    for _, choice in ipairs(choices) do
+        if hasLineOfSightFrom(sourcePosition, character, choice.Part.Position) then
+            return choice.Part, choice.ScreenDistance
+        end
+    end
+
+    return nil
 end
 
-local function targetStillValid(player, fovMultiplier)
-    if not player or not State.Alive then
-        return false, nil, nil
+--// Smoothed movement prediction
+local function getTrackedVelocity(part)
+    if not part or not part:IsA("BasePart") then
+        return Vector3.new()
     end
-    if not isEnemy(player, Config.Aim.TeamCheck) then
+
+    local rawVelocity = part.AssemblyLinearVelocity or Vector3.new()
+    local now = os.clock()
+    local sample = State.VelocitySamples[part]
+
+    if not sample then
+        sample = {
+            Velocity = rawVelocity,
+            Time = now,
+        }
+        State.VelocitySamples[part] = sample
+        return rawVelocity
+    end
+
+    local dt = math.max(0, now - (sample.Time or now))
+    sample.Time = now
+
+    if dt > 0.25 then
+        sample.Velocity = rawVelocity
+        return rawVelocity
+    end
+
+    local smoothing = math.clamp((tonumber(Config.Aim.PredictionSmoothing) or 0) / 100, 0, 0.95)
+    local baseAlpha = math.clamp(1 - smoothing, 0.05, 1)
+    local frameFactor = math.max(dt * 60, 0.25)
+    local alpha = 1 - ((1 - baseAlpha) ^ frameFactor)
+
+    sample.Velocity = sample.Velocity:Lerp(rawVelocity, math.clamp(alpha, 0.02, 1))
+    return sample.Velocity
+end
+
+local function clampPredictionOffset(offset)
+    local maxOffset = math.max(0, tonumber(Config.Aim.MaxPredictionOffset) or 0)
+    if maxOffset > 0 and offset.Magnitude > maxOffset then
+        return offset.Unit * maxOffset
+    end
+    return offset
+end
+
+local function getCameraAimPoint(part)
+    if not part or not part:IsA("BasePart") then
+        return nil
+    end
+
+    local point = part.Position
+    if Config.Aim.Prediction then
+        local velocity = getTrackedVelocity(part)
+        local predictionTime = math.max(0, tonumber(Config.Aim.PredictionTime) or 0)
+        point = point + clampPredictionOffset(velocity * predictionTime)
+    end
+    return point
+end
+
+--// Shared target selection
+local function modeFOV(mode)
+    if mode == "SilentAim" then
+        return math.max(1, tonumber(Config.Aim.SilentAimFOV) or 1)
+    end
+    return math.max(1, tonumber(Config.Aim.AimbotFOV) or 1)
+end
+
+local function targetStillValid(mode, player, fovMultiplier, sourcePosition)
+    if not player or not State.Alive or not isEnemy(player, Config.Aim.TeamCheck) then
         return false, nil, nil
     end
 
-    local character, humanoid, root = getCharacterData(player)
+    local character, _, root = getCharacterData(player)
     if not character then
         return false, nil, nil
     end
@@ -386,88 +498,100 @@ local function targetStillValid(player, fovMultiplier)
         return false, nil, nil
     end
 
-    local cameraPos = Camera.CFrame.Position
-    local distance3D = (root.Position - cameraPos).Magnitude
+    local distance3D = (root.Position - Camera.CFrame.Position).Magnitude
     if distance3D > Config.Aim.MaxDistance then
         return false, nil, nil
     end
 
     local screenOrigin = getAimOrigin2D()
-    local part = getTargetPart(character, screenOrigin)
+    local part = getPreferredTargetPart(character, screenOrigin)
     if not part then
         return false, nil, nil
     end
 
-    local point = getPredictedPoint(part)
-    local screenPos, onScreen, depth = worldToScreen(point)
-    if not screenPos or depth <= 0 or not onScreen then
+    local screenPos, onScreen, depth = worldToScreen(part.Position)
+    if not screenPos or not onScreen or depth <= 0 then
         return false, nil, nil
     end
 
-    local allowedFOV = Config.Aim.FOV * (fovMultiplier or 1)
-    if (screenPos - screenOrigin).Magnitude > allowedFOV then
+    local allowedFOV = modeFOV(mode) * (fovMultiplier or 1)
+    local screenDistance = (screenPos - screenOrigin).Magnitude
+    if screenDistance > allowedFOV then
         return false, nil, nil
     end
 
-    if not isVisible(character, point) then
-        return false, nil, nil
+    if Config.Aim.VisibleCheck then
+        local source = sourcePosition or Camera.CFrame.Position
+        if not hasLineOfSightFrom(source, character, part.Position) then
+            if Config.Aim.AimPoint ~= "Closest Part" then
+                return false, nil, nil
+            end
+
+            local visiblePart, visibleDistance = getClosestVisibleBodyPart(character, screenOrigin, source)
+            if not visiblePart or visibleDistance > allowedFOV then
+                return false, nil, nil
+            end
+            part = visiblePart
+        end
     end
 
-    return true, part, point
+    local point = mode == "Aimbot" and getCameraAimPoint(part) or part.Position
+    return point ~= nil, part, point
 end
 
-local function selectBestTarget()
+local function selectBestTarget(mode, sourcePosition)
     Camera = workspace.CurrentCamera or Camera
     if not Camera then
-        State.CurrentTarget = nil
-        State.CurrentPart = nil
-        State.CurrentAimPoint = nil
+        clearTarget(mode)
         return nil
     end
 
-    if Config.Aim.StickyTarget and State.CurrentTarget then
-        local ok, part, point = targetStillValid(
-            State.CurrentTarget,
-            Config.Aim.StickyFOVMultiplier
+    local targetState = State.Targets[mode]
+    local stickyMultiplier = math.max(1, tonumber(Config.Aim.StickyFOVMultiplier) or 1)
+
+    if Config.Aim.StickyTarget and targetState.Player then
+        local valid, part, point = targetStillValid(
+            mode,
+            targetState.Player,
+            stickyMultiplier,
+            sourcePosition
         )
-        if ok then
-            State.CurrentPart = part
-            State.CurrentAimPoint = point
-            return State.CurrentTarget, part, point
+        if valid then
+            targetState.Part = part
+            targetState.Point = point
+            return targetState.Player, part, point
         end
     end
 
     local screenOrigin = getAimOrigin2D()
-    local cameraPos = Camera.CFrame.Position
-    local bestPlayer = nil
-    local bestPart = nil
-    local bestPoint = nil
-    local bestScore = math.huge
+    local cameraPosition = Camera.CFrame.Position
+    local maxFOV = modeFOV(mode)
+    local maxDistance = math.max(0, tonumber(Config.Aim.MaxDistance) or 0)
+    local candidates = {}
 
+    -- Build/sort candidates before raycasting. In a full server this turns the
+    -- visibility check from "raycast every player every frame" into "raycast
+    -- the best few candidates until a valid target is found".
     for _, player in ipairs(Players:GetPlayers()) do
         if isEnemy(player, Config.Aim.TeamCheck) then
-            local character, humanoid, root = getCharacterData(player)
+            local character, _, root = getCharacterData(player)
             if character then
-                local distance3D = (root.Position - cameraPos).Magnitude
-                if distance3D <= Config.Aim.MaxDistance then
-                    local part = getTargetPart(character, screenOrigin)
+                local distance3D = (root.Position - cameraPosition).Magnitude
+                if distance3D <= maxDistance then
+                    local part = getPreferredTargetPart(character, screenOrigin)
                     if part then
-                        local point = getPredictedPoint(part)
-                        local screenPos, onScreen, depth = worldToScreen(point)
+                        local screenPos, onScreen, depth = worldToScreen(part.Position)
                         if screenPos and onScreen and depth > 0 then
                             local screenDistance = (screenPos - screenOrigin).Magnitude
-                            if screenDistance <= Config.Aim.FOV then
-                                if isVisible(character, point) then
-                                    -- Screen distance is the primary metric; tiny distance
-                                    -- weighting breaks ties without pulling aim off-crosshair.
-                                    local score = screenDistance + (distance3D * 0.0005)
-                                    if score < bestScore then
-                                        bestScore = score
-                                        bestPlayer = player
-                                        bestPart = part
-                                        bestPoint = point
-                                    end
-                                end
+                            if screenDistance <= maxFOV then
+                                candidates[#candidates + 1] = {
+                                    Player = player,
+                                    Character = character,
+                                    Part = part,
+                                    ScreenDistance = screenDistance,
+                                    Distance3D = distance3D,
+                                    Score = screenDistance + (distance3D * 0.0005),
+                                }
                             end
                         end
                     end
@@ -476,25 +600,74 @@ local function selectBestTarget()
         end
     end
 
-    State.CurrentTarget = bestPlayer
-    State.CurrentPart = bestPart
-    State.CurrentAimPoint = bestPoint
-    return bestPlayer, bestPart, bestPoint
+    table.sort(candidates, function(a, b)
+        return a.Score < b.Score
+    end)
+
+    local source = sourcePosition or cameraPosition
+
+    for _, candidate in ipairs(candidates) do
+        local part = candidate.Part
+        local screenDistance = candidate.ScreenDistance
+
+        if Config.Aim.VisibleCheck
+            and not hasLineOfSightFrom(source, candidate.Character, part.Position) then
+
+            if Config.Aim.AimPoint == "Closest Part" then
+                part, screenDistance = getClosestVisibleBodyPart(
+                    candidate.Character,
+                    screenOrigin,
+                    source
+                )
+            else
+                part = nil
+            end
+        end
+
+        if part and screenDistance <= maxFOV then
+            local point = mode == "Aimbot" and getCameraAimPoint(part) or part.Position
+            if point then
+                targetState.Player = candidate.Player
+                targetState.Part = part
+                targetState.Point = point
+                return candidate.Player, part, point
+            end
+        end
+    end
+
+    clearTarget(mode)
+    return nil
 end
 
-local function aimActivationHeld()
-    if not Config.Aim.Enabled then
-        return false
-    end
-
-    if not Config.Aim.HoldRMB then
-        return true
-    end
-
+local function rmbHeld()
     return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
 end
 
---// Game-specific ballistic alignment
+local function aimbotActivationHeld()
+    if not Config.Aim.Aimbot then
+        return false
+    end
+    return not Config.Aim.HoldRMB or rmbHeld()
+end
+
+local function silentAimActivationHeld()
+    if not Config.Aim.SilentAim then
+        return false
+    end
+    return not Config.Aim.SilentAimHoldRMB or rmbHeld()
+end
+
+--// Cold War projectile-native silent aim
+local function getWeaponName(toolOrName)
+    if typeof(toolOrName) == "Instance" then
+        return toolOrName.Name
+    end
+    if type(toolOrName) == "string" then
+        return toolOrName
+    end
+    return nil
+end
+
 local function getTimeForDistance(speed, decay, distance)
     speed = tonumber(speed) or 0
     decay = math.max(0, tonumber(decay) or 0)
@@ -503,7 +676,7 @@ local function getTimeForDistance(speed, decay, distance)
     if distance <= 0 then
         return 0
     end
-    if speed <= 0.001 then
+    if speed <= 0.000001 then
         return nil
     end
 
@@ -512,74 +685,103 @@ local function getTimeForDistance(speed, decay, distance)
         if distance >= maxForward then
             return nil
         end
+
         local inside = 1 - (distance * decay / speed)
         if inside <= 0 then
             return nil
         end
+
         return -(1 / decay) * math.log(inside)
     end
 
     return distance / speed
 end
 
-local function getBallisticAimPoint(tool, muzzleIndex, bulletIndex, origin, targetPart)
-    local point = targetPart.Position
+local function getBulletSettings(toolOrName, muzzleIndex, bulletIndex)
     local manager = State.Ballistics.WeaponConfigManager
-    if not manager or not tool or typeof(tool) ~= "Instance" then
-        return getPredictedPoint(targetPart) or point
+    local weaponName = getWeaponName(toolOrName)
+    if not manager or not weaponName then
+        return nil
     end
 
     local ok, muzzleConfig = pcall(function()
-        return manager:GetMuzzleConfig(tool.Name, muzzleIndex or 1)
+        return manager:GetMuzzleConfig(weaponName, muzzleIndex or 1)
     end)
     if not ok or type(muzzleConfig) ~= "table" then
-        return getPredictedPoint(targetPart) or point
+        return nil
     end
 
     local bullets = muzzleConfig.BulletSettings
     local bullet = type(bullets) == "table" and bullets[bulletIndex or 1] or nil
     if type(bullet) ~= "table" then
-        return getPredictedPoint(targetPart) or point
+        return nil
+    end
+
+    return bullet, muzzleConfig
+end
+
+local function getBallisticAimPoint(toolOrName, muzzleIndex, bulletIndex, origin, targetPart)
+    local basePoint = targetPart.Position
+    local bullet = getBulletSettings(toolOrName, muzzleIndex, bulletIndex)
+
+    if not bullet then
+        if Config.Aim.Prediction then
+            return basePoint + clampPredictionOffset(
+                getTrackedVelocity(targetPart) * math.max(0, Config.Aim.PredictionTime)
+            )
+        end
+        return basePoint
     end
 
     local speed = tonumber(bullet.MuzzleVelocity) or 0
-    local decay = tonumber(bullet.Drag) or 0
+    local decay = math.max(0, tonumber(bullet.Drag) or 0)
     if speed <= 0 then
-        return getPredictedPoint(targetPart) or point
+        return basePoint
     end
 
-    local velocity = targetPart.AssemblyLinearVelocity or Vector3.new()
-    local solved = point
+    local velocity = Config.Aim.Prediction and getTrackedVelocity(targetPart) or Vector3.new()
+    local solved = basePoint
 
-    -- Two light iterations are enough because target lead/drop are small relative
-    -- to the total range. This mirrors the game's exponential forward decay.
-    for _ = 1, 2 do
+    -- The supplied place's Trajectory module uses:
+    --   forward = speed/drag * (1 - exp(-drag*t))
+    --   drop    = 0.5 * gravity * t^2
+    -- Iterate because lead and drop slightly change the distance/time solution.
+    for _ = 1, 3 do
         local distance = (solved - origin).Magnitude
         local travelTime = getTimeForDistance(speed, decay, distance)
         if not travelTime then
             break
         end
+
         travelTime = math.clamp(travelTime, 0, 3)
 
         local lead = Vector3.new()
         if Config.Aim.Prediction then
-            lead = velocity * travelTime
-            lead = clampPredictionOffset(lead)
+            lead = clampPredictionOffset(velocity * travelTime)
         end
 
         local dropCompensation = Vector3.new()
-        if Config.Aim.BallisticCompensation then
-            dropCompensation = Vector3.new(0, 0.5 * workspace.Gravity * travelTime * travelTime, 0)
+        if Config.Aim.BulletDropCompensation then
+            dropCompensation = Vector3.new(
+                0,
+                0.5 * workspace.Gravity * travelTime * travelTime,
+                0
+            )
         end
 
-        solved = point + lead + dropCompensation
+        solved = basePoint + lead + dropCompensation
     end
 
     return solved
 end
 
 local function rotateDirection(vector, fromDirection, toDirection)
-    if not vector or not fromDirection or not toDirection then
+    if typeof(vector) ~= "Vector3"
+        or typeof(fromDirection) ~= "Vector3"
+        or typeof(toDirection) ~= "Vector3"
+        or vector.Magnitude <= 0.000001
+        or fromDirection.Magnitude <= 0.000001
+        or toDirection.Magnitude <= 0.000001 then
         return vector
     end
 
@@ -588,7 +790,7 @@ local function rotateDirection(vector, fromDirection, toDirection)
     local dot = math.clamp(from:Dot(to), -1, 1)
 
     if dot > 0.999999 then
-        return vector
+        return vector.Unit
     end
 
     local axis = from:Cross(to)
@@ -600,14 +802,14 @@ local function rotateDirection(vector, fromDirection, toDirection)
     end
 
     if axis.Magnitude < 0.000001 then
-        return vector
+        return to
     end
 
     local rotation = CFrame.fromAxisAngle(axis.Unit, math.acos(dot))
-    return rotation:VectorToWorldSpace(vector).Unit
+    return rotation:VectorToWorldSpace(vector.Unit)
 end
 
-local function installBallisticAlign()
+local function installSilentAim()
     if State.Ballistics.Installed or not State.Alive then
         return State.Ballistics.Installed
     end
@@ -615,7 +817,6 @@ local function installBallisticAlign()
     local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
     local ballisticsClient = playerScripts and playerScripts:FindFirstChild("BallisticsClient")
     local clientFireModule = ballisticsClient and ballisticsClient:FindFirstChild("ClientFire")
-
     if not clientFireModule or not clientFireModule:IsA("ModuleScript") then
         return false
     end
@@ -625,8 +826,8 @@ local function installBallisticAlign()
         return false
     end
 
-    local managerModule = ReplicatedStorage:FindFirstChild("Shared")
-    managerModule = managerModule and managerModule:FindFirstChild("WeaponConfigManager")
+    local shared = ReplicatedStorage:FindFirstChild("Shared")
+    local managerModule = shared and shared:FindFirstChild("WeaponConfigManager")
     if managerModule and managerModule:IsA("ModuleScript") then
         local okManager, manager = pcall(require, managerModule)
         if okManager and type(manager) == "table" then
@@ -637,19 +838,17 @@ local function installBallisticAlign()
     local original = ClientFire.fireVolley
     local wrapper
 
-    wrapper = function(tool, muzzleIndex, bulletIndex, origin, directions, options)
+    wrapper = function(toolOrName, muzzleIndex, bulletIndex, origin, directions, options)
         if State.Alive
-            and Config.Aim.Enabled
-            and Config.Aim.BallisticAlign
-            and aimActivationHeld()
+            and silentAimActivationHeld()
             and typeof(origin) == "Vector3"
             and type(directions) == "table"
             and #directions > 0 then
 
-            local player, part = selectBestTarget()
+            local player, part = selectBestTarget("SilentAim", origin)
             if player and part and part.Parent then
                 local desiredPoint = getBallisticAimPoint(
-                    tool,
+                    toolOrName,
                     muzzleIndex,
                     bulletIndex,
                     origin,
@@ -664,14 +863,17 @@ local function installBallisticAlign()
 
                         if Config.Aim.PreserveSpread then
                             local average = Vector3.new()
+                            local validDirections = 0
+
                             for i = 1, #directions do
                                 local direction = directions[i]
-                                if typeof(direction) == "Vector3" then
+                                if typeof(direction) == "Vector3" and direction.Magnitude > 0.000001 then
                                     average = average + direction.Unit
+                                    validDirections = validDirections + 1
                                 end
                             end
 
-                            if average.Magnitude > 0.000001 then
+                            if validDirections > 0 and average.Magnitude > 0.000001 then
                                 average = average.Unit
                                 for i = 1, #directions do
                                     local direction = directions[i]
@@ -698,7 +900,7 @@ local function installBallisticAlign()
             end
         end
 
-        return original(tool, muzzleIndex, bulletIndex, origin, directions, options)
+        return original(toolOrName, muzzleIndex, bulletIndex, origin, directions, options)
     end
 
     ClientFire.fireVolley = wrapper
@@ -709,11 +911,12 @@ local function installBallisticAlign()
     return true
 end
 
--- Retry while the character/player scripts are still loading.
+-- Load the native projectile backend whether or not Silent Aim starts enabled,
+-- so turning it on later is immediate.
 task.spawn(function()
     while State.Alive and not State.Ballistics.Installed do
-        pcall(installBallisticAlign)
-        task.wait(1)
+        pcall(installSilentAim)
+        task.wait(0.75)
     end
 end)
 
@@ -724,10 +927,12 @@ local function newDrawing(kind)
     if not DrawingAvailable then
         return nil
     end
+
     local ok, object = pcall(Drawing.new, kind)
     if not ok then
         return nil
     end
+
     object.Visible = false
     return object
 end
@@ -864,8 +1069,46 @@ local ESP_VISIBLE_COLOR = Color3.fromRGB(80, 255, 120)
 local ESP_OCCLUDED_OUTLINE = Color3.fromRGB(255, 220, 220)
 local ESP_VISIBLE_OUTLINE = Color3.fromRGB(205, 255, 215)
 
-local function updateHighlight(player, character, onScreen, lineOfSight)
-    if not Config.ESP.Chams or not onScreen then
+local function isCharacterVisible(character)
+    if not character then
+        return false
+    end
+
+    Camera = workspace.CurrentCamera or Camera
+    if not Camera then
+        return false
+    end
+
+    local origin = Camera.CFrame.Position
+    for _, name in ipairs(VISIBILITY_PART_NAMES) do
+        local part = character:FindFirstChild(name)
+        if part and part:IsA("BasePart")
+            and hasLineOfSightFrom(origin, character, part.Position) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function getCachedESPVisibility(player, character)
+    local now = os.clock()
+    local cache = State.ESPVisibility[player]
+    if cache and now < cache.NextUpdate and cache.Character == character then
+        return cache.Value
+    end
+
+    local visible = isCharacterVisible(character)
+    State.ESPVisibility[player] = {
+        Value = visible,
+        Character = character,
+        NextUpdate = now + math.max(0.03, tonumber(Config.ESP.VisibilityRefresh) or 0.10),
+    }
+    return visible
+end
+
+local function updateHighlight(player, character, lineOfSight)
+    if not Config.ESP.Chams then
         destroyHighlight(player)
         return
     end
@@ -891,42 +1134,45 @@ local function updateHighlight(player, character, onScreen, lineOfSight)
 end
 
 local function updatePlayerESP(player)
-    local bundle = createESP(player)
+    local existing = State.Drawings[player]
 
     if not Config.ESP.Enabled or not isEnemy(player, Config.ESP.TeamCheck) then
-        hideBundle(bundle)
+        hideBundle(existing)
         destroyHighlight(player)
         return
     end
 
     local character, humanoid, root = getCharacterData(player)
     if not character then
-        hideBundle(bundle)
+        hideBundle(existing)
         destroyHighlight(player)
         return
     end
 
     Camera = workspace.CurrentCamera or Camera
     if not Camera then
-        hideBundle(bundle)
+        hideBundle(existing)
         destroyHighlight(player)
         return
     end
 
     local distance = (root.Position - Camera.CFrame.Position).Magnitude
     if distance > Config.ESP.MaxDistance then
-        hideBundle(bundle)
+        hideBundle(existing)
         destroyHighlight(player)
         return
     end
 
-    local rootScreen, rootOnScreen, rootDepth = worldToScreen(root.Position)
-    local onScreen = rootScreen ~= nil and rootDepth > 0 and rootOnScreen
-    local lineOfSight = isCharacterVisible(character)
+    local lineOfSight = getCachedESPVisibility(player, character)
     local visibleColoring = Config.ESP.VisibleGreen and lineOfSight
     local espColor = visibleColoring and ESP_VISIBLE_COLOR or ESP_OCCLUDED_COLOR
-    updateHighlight(player, character, onScreen or rootDepth > 0, lineOfSight)
+    updateHighlight(player, character, lineOfSight)
 
+    if not DrawingAvailable then
+        return
+    end
+
+    local bundle = existing or createESP(player)
     local topLeft, bottomRight = getScreenBounds(character)
     if not topLeft or not bottomRight then
         hideBundle(bundle)
@@ -944,22 +1190,12 @@ local function updatePlayerESP(player)
     if humanoid.MaxHealth > 0 then
         healthRatio = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
     end
-
     local healthColor = Color3.new(1 - healthRatio, healthRatio, 0)
 
-    -- Visible enemies are green; enemies behind geometry stay red.
-    if bundle.Box then
-        bundle.Box.Color = espColor
-    end
-    if bundle.Name then
-        bundle.Name.Color = espColor
-    end
-    if bundle.Distance then
-        bundle.Distance.Color = espColor
-    end
-    if bundle.Tracer then
-        bundle.Tracer.Color = espColor
-    end
+    if bundle.Box then bundle.Box.Color = espColor end
+    if bundle.Name then bundle.Name.Color = espColor end
+    if bundle.Distance then bundle.Distance.Color = espColor end
+    if bundle.Tracer then bundle.Tracer.Color = espColor end
 
     if bundle.BoxOutline then
         bundle.BoxOutline.Visible = Config.ESP.Boxes
@@ -990,7 +1226,10 @@ local function updatePlayerESP(player)
     if bundle.Distance then
         bundle.Distance.Visible = Config.ESP.Distance
         bundle.Distance.Text = tostring(math.floor(distance + 0.5)) .. " studs"
-        bundle.Distance.Position = Vector2.new(centerX, bottomRight.Y + (Config.ESP.Health and 17 or 3))
+        bundle.Distance.Position = Vector2.new(
+            centerX,
+            bottomRight.Y + (Config.ESP.Health and 17 or 3)
+        )
     end
 
     local healthX = topLeft.X - 5
@@ -1011,19 +1250,31 @@ local function updatePlayerESP(player)
 
     if bundle.Tracer then
         bundle.Tracer.Visible = Config.ESP.Tracers
-        bundle.Tracer.From = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y - 2)
+        bundle.Tracer.From = Vector2.new(
+            Camera.ViewportSize.X * 0.5,
+            Camera.ViewportSize.Y - 2
+        )
         bundle.Tracer.To = Vector2.new(centerX, bottomRight.Y)
     end
 end
 
---// FOV circle
-local FOVCircle = newDrawing("Circle")
-if FOVCircle then
-    FOVCircle.Filled = false
-    FOVCircle.Thickness = 1
-    FOVCircle.NumSides = 96
-    FOVCircle.Color = Color3.fromRGB(235, 235, 235)
-    FOVCircle.Transparency = 0.75
+--// FOV circles
+local AimbotFOVCircle = newDrawing("Circle")
+if AimbotFOVCircle then
+    AimbotFOVCircle.Filled = false
+    AimbotFOVCircle.Thickness = 1
+    AimbotFOVCircle.NumSides = 96
+    AimbotFOVCircle.Color = Color3.fromRGB(235, 235, 235)
+    AimbotFOVCircle.Transparency = 0.75
+end
+
+local SilentAimFOVCircle = newDrawing("Circle")
+if SilentAimFOVCircle then
+    SilentAimFOVCircle.Filled = false
+    SilentAimFOVCircle.Thickness = 1
+    SilentAimFOVCircle.NumSides = 96
+    SilentAimFOVCircle.Color = Color3.fromRGB(70, 140, 255)
+    SilentAimFOVCircle.Transparency = 0.72
 end
 
 --// PuckUI
@@ -1031,35 +1282,64 @@ local Window = PuckUI:CreateWindow({
     Name = "PuckAFK · Cold War",
     GuiName = "PuckAFK_ColdWar_AimESP",
     ConfigId = "ColdWarAimESP",
-    Width = 500,
-    Height = 560,
+    Width = 520,
+    Height = 570,
 })
 
 local AimTab = Window:CreateTab("Aim")
-AimTab:CreateSection("Targeting")
+AimTab:CreateSection("Modes")
 
 AimTab:CreateToggle({
-    Name = "Enable Aim",
+    Name = "Aimbot",
     ConfigKey = "Aim.Enabled",
-    CurrentValue = Config.Aim.Enabled,
+    CurrentValue = Config.Aim.Aimbot,
     Callback = function(value)
-        Config.Aim.Enabled = value == true
-        if not Config.Aim.Enabled then
-            State.CurrentTarget = nil
-            State.CurrentPart = nil
-            State.CurrentAimPoint = nil
+        Config.Aim.Aimbot = value == true
+        if not Config.Aim.Aimbot then
+            clearTarget("Aimbot")
         end
     end,
 })
 
 AimTab:CreateToggle({
-    Name = "Hold RMB",
+    Name = "Silent Aim",
+    ConfigKey = "Aim.BallisticAlign",
+    CurrentValue = Config.Aim.SilentAim,
+    Callback = function(value)
+        Config.Aim.SilentAim = value == true
+        if Config.Aim.SilentAim and not State.Ballistics.Installed then
+            pcall(installSilentAim)
+        elseif not Config.Aim.SilentAim then
+            clearTarget("SilentAim")
+        end
+    end,
+})
+
+AimTab:CreateToggle({
+    Name = "Hold RMB For Aimbot",
     ConfigKey = "Aim.HoldRMB",
     CurrentValue = Config.Aim.HoldRMB,
     Callback = function(value)
         Config.Aim.HoldRMB = value == true
+        if Config.Aim.HoldRMB and not rmbHeld() then
+            clearTarget("Aimbot")
+        end
     end,
 })
+
+AimTab:CreateToggle({
+    Name = "Hold RMB For Silent Aim",
+    ConfigKey = "Aim.SilentAimHoldRMB",
+    CurrentValue = Config.Aim.SilentAimHoldRMB,
+    Callback = function(value)
+        Config.Aim.SilentAimHoldRMB = value == true
+        if Config.Aim.SilentAimHoldRMB and not rmbHeld() then
+            clearTarget("SilentAim")
+        end
+    end,
+})
+
+AimTab:CreateSection("Targeting")
 
 AimTab:CreateToggle({
     Name = "Team Check",
@@ -1067,6 +1347,7 @@ AimTab:CreateToggle({
     CurrentValue = Config.Aim.TeamCheck,
     Callback = function(value)
         Config.Aim.TeamCheck = value == true
+        clearAllTargets()
     end,
 })
 
@@ -1076,39 +1357,46 @@ AimTab:CreateToggle({
     CurrentValue = Config.Aim.VisibleCheck,
     Callback = function(value)
         Config.Aim.VisibleCheck = value == true
+        clearAllTargets()
     end,
 })
 
 AimTab:CreateDropdown({
-    Name = "Aim Point",
+    Name = "Target Part",
     ConfigKey = "Aim.AimPoint",
-    Options = {"Head", "Torso", "Closest Part"},
+    Options = {"Head", "Upper Torso", "Closest Part"},
     CurrentOption = {Config.Aim.AimPoint},
     Callback = function(value)
-        Config.Aim.AimPoint = tostring(normalizeDropdown(value) or "Head")
+        local selected = tostring(normalizeDropdown(value) or "Head")
+        if selected == "Torso" then
+            selected = "Upper Torso"
+        end
+        Config.Aim.AimPoint = selected
+        clearAllTargets()
     end,
 })
 
 AimTab:CreateSlider({
-    Name = "FOV",
+    Name = "Aimbot FOV",
     ConfigKey = "Aim.FOV",
     Range = {30, 700},
     Increment = 5,
-    CurrentValue = Config.Aim.FOV,
+    CurrentValue = Config.Aim.AimbotFOV,
     Suffix = " px",
     Callback = function(value)
-        Config.Aim.FOV = tonumber(value) or Config.Aim.FOV
+        Config.Aim.AimbotFOV = tonumber(value) or Config.Aim.AimbotFOV
     end,
 })
 
 AimTab:CreateSlider({
-    Name = "Aim Speed",
-    ConfigKey = "Aim.AimSpeed",
-    Range = {1, 80},
-    Increment = 1,
-    CurrentValue = Config.Aim.AimSpeed,
+    Name = "Silent Aim FOV",
+    ConfigKey = "Aim.SilentAimFOV",
+    Range = {30, 900},
+    Increment = 5,
+    CurrentValue = Config.Aim.SilentAimFOV,
+    Suffix = " px",
     Callback = function(value)
-        Config.Aim.AimSpeed = tonumber(value) or Config.Aim.AimSpeed
+        Config.Aim.SilentAimFOV = tonumber(value) or Config.Aim.SilentAimFOV
     end,
 })
 
@@ -1124,7 +1412,18 @@ AimTab:CreateSlider({
     end,
 })
 
-AimTab:CreateSection("Tracking")
+AimTab:CreateSection("Aimbot")
+
+AimTab:CreateSlider({
+    Name = "Aim Speed",
+    ConfigKey = "Aim.AimSpeed",
+    Range = {1, 80},
+    Increment = 1,
+    CurrentValue = Config.Aim.AimSpeed,
+    Callback = function(value)
+        Config.Aim.AimSpeed = tonumber(value) or Config.Aim.AimSpeed
+    end,
+})
 
 AimTab:CreateToggle({
     Name = "Sticky Target",
@@ -1132,11 +1431,37 @@ AimTab:CreateToggle({
     CurrentValue = Config.Aim.StickyTarget,
     Callback = function(value)
         Config.Aim.StickyTarget = value == true
+        if not Config.Aim.StickyTarget then
+            clearAllTargets()
+        end
+    end,
+})
+
+AimTab:CreateSlider({
+    Name = "Sticky FOV",
+    ConfigKey = "Aim.StickyFOVMultiplierPercent",
+    Range = {100, 200},
+    Increment = 5,
+    CurrentValue = math.floor(Config.Aim.StickyFOVMultiplier * 100 + 0.5),
+    Suffix = "%",
+    Callback = function(value)
+        Config.Aim.StickyFOVMultiplier = math.max(1, (tonumber(value) or 100) / 100)
     end,
 })
 
 AimTab:CreateToggle({
-    Name = "Prediction",
+    Name = "Show Aimbot FOV",
+    ConfigKey = "Aim.ShowFOV",
+    CurrentValue = Config.Aim.ShowAimbotFOV,
+    Callback = function(value)
+        Config.Aim.ShowAimbotFOV = value == true
+    end,
+})
+
+AimTab:CreateSection("Prediction")
+
+AimTab:CreateToggle({
+    Name = "Movement Prediction",
     ConfigKey = "Aim.Prediction",
     CurrentValue = Config.Aim.Prediction,
     Callback = function(value)
@@ -1145,46 +1470,49 @@ AimTab:CreateToggle({
 })
 
 AimTab:CreateSlider({
-    Name = "Prediction Time",
+    Name = "Aimbot Lead",
     ConfigKey = "Aim.PredictionTimeMs",
     Range = {0, 200},
     Increment = 5,
     CurrentValue = math.floor(Config.Aim.PredictionTime * 1000 + 0.5),
     Suffix = " ms",
     Callback = function(value)
-        Config.Aim.PredictionTime = (tonumber(value) or 0) / 1000
+        Config.Aim.PredictionTime = math.max(0, (tonumber(value) or 0) / 1000)
     end,
 })
 
-AimTab:CreateToggle({
-    Name = "Show FOV",
-    ConfigKey = "Aim.ShowFOV",
-    CurrentValue = Config.Aim.ShowFOV,
+AimTab:CreateSlider({
+    Name = "Velocity Smoothing",
+    ConfigKey = "Aim.PredictionSmoothing",
+    Range = {0, 95},
+    Increment = 5,
+    CurrentValue = Config.Aim.PredictionSmoothing,
+    Suffix = "%",
     Callback = function(value)
-        Config.Aim.ShowFOV = value == true
+        Config.Aim.PredictionSmoothing = tonumber(value) or Config.Aim.PredictionSmoothing
     end,
 })
 
-AimTab:CreateSection("Ballistics")
-
-AimTab:CreateToggle({
-    Name = "Ballistic Align",
-    ConfigKey = "Aim.BallisticAlign",
-    CurrentValue = Config.Aim.BallisticAlign,
+AimTab:CreateSlider({
+    Name = "Max Lead Offset",
+    ConfigKey = "Aim.MaxPredictionOffset",
+    Range = {0, 60},
+    Increment = 1,
+    CurrentValue = Config.Aim.MaxPredictionOffset,
+    Suffix = " studs",
     Callback = function(value)
-        Config.Aim.BallisticAlign = value == true
-        if Config.Aim.BallisticAlign and not State.Ballistics.Installed then
-            pcall(installBallisticAlign)
-        end
+        Config.Aim.MaxPredictionOffset = tonumber(value) or Config.Aim.MaxPredictionOffset
     end,
 })
+
+AimTab:CreateSection("Silent Aim")
 
 AimTab:CreateToggle({
     Name = "Bullet Drop Compensation",
     ConfigKey = "Aim.BallisticCompensation",
-    CurrentValue = Config.Aim.BallisticCompensation,
+    CurrentValue = Config.Aim.BulletDropCompensation,
     Callback = function(value)
-        Config.Aim.BallisticCompensation = value == true
+        Config.Aim.BulletDropCompensation = value == true
     end,
 })
 
@@ -1197,8 +1525,17 @@ AimTab:CreateToggle({
     end,
 })
 
-local AimStatus = AimTab:CreateLabel("Target: none")
-local BallisticStatus = AimTab:CreateLabel("Ballistics: waiting for PlayerScripts...")
+AimTab:CreateToggle({
+    Name = "Show Silent Aim FOV",
+    ConfigKey = "Aim.ShowSilentAimFOV",
+    CurrentValue = Config.Aim.ShowSilentAimFOV,
+    Callback = function(value)
+        Config.Aim.ShowSilentAimFOV = value == true
+    end,
+})
+
+local AimbotStatus = AimTab:CreateLabel("Aimbot target: none")
+local SilentAimStatus = AimTab:CreateLabel("Silent Aim: loading weapon backend...")
 
 local ESPTab = Window:CreateTab("ESP")
 ESPTab:CreateSection("Visuals")
@@ -1209,6 +1546,14 @@ ESPTab:CreateToggle({
     CurrentValue = Config.ESP.Enabled,
     Callback = function(value)
         Config.ESP.Enabled = value == true
+        if not Config.ESP.Enabled then
+            for _, bundle in pairs(State.Drawings) do
+                hideBundle(bundle)
+            end
+            for player in pairs(State.Highlights) do
+                destroyHighlight(player)
+            end
+        end
     end,
 })
 
@@ -1304,15 +1649,15 @@ ESPTab:CreateSlider({
 })
 
 local ESPStatus = ESPTab:CreateLabel(
-    DrawingAvailable and "Drawing ESP: ready" or "Drawing ESP unavailable; chams still work"
+    DrawingAvailable and "ESP ready" or "Chams ready · Drawing API unavailable"
 )
 
 local SettingsTab = Window:CreateTab("Settings")
 SettingsTab:CreateSection("Script")
 SettingsTab:CreateParagraph({
-    Title = "Cold War backend",
-    Content = "Aim runs after the game's recoil camera step and before late weapon/viewmodel rendering. Ballistic Align is optional and targets the game's ClientFire projectile directions.",
-    Height = 72,
+    Title = "Aim modes",
+    Content = "Aimbot moves the camera. Silent Aim redirects Cold War's outgoing projectiles without moving the camera. Both switches work independently.",
+    Height = 64,
 })
 
 local function cleanup(destroyWindow)
@@ -1357,7 +1702,8 @@ local function cleanup(destroyWindow)
         destroyHighlight(player)
     end
 
-    safeRemoveDrawing(FOVCircle)
+    safeRemoveDrawing(AimbotFOVCircle)
+    safeRemoveDrawing(SilentAimFOVCircle)
 
     ENV.__PUCKAFK_COLDWAR_AIM_ESP_CLEANUP = nil
 
@@ -1383,12 +1729,15 @@ Window:SetCloseCallback(function()
     cleanup(true)
 end)
 
--- Player lifecycle cleanup
+-- PuckUI automatically injects its shared Interface controls into Settings and
+-- creates the persistent Configs tab for this ConfigId.
+
+--// Player / camera lifecycle
 connect(Players.PlayerRemoving, function(player)
-    if State.CurrentTarget == player then
-        State.CurrentTarget = nil
-        State.CurrentPart = nil
-        State.CurrentAimPoint = nil
+    for mode, target in pairs(State.Targets) do
+        if target.Player == player then
+            clearTarget(mode)
+        end
     end
     destroyESP(player)
 end)
@@ -1404,12 +1753,12 @@ connect(workspace:GetPropertyChangedSignal("CurrentCamera"), function()
     end
 end)
 
--- Camera aim: the inspected game applies recoil at Camera + 1, so +2 lets us
--- correct the final camera while still leaving late weapon/viewmodel logic time
--- to consume that corrected orientation before a shot.
+-- The supplied WEATHER/MINIMAP build binds WeatherScreenDroplets at Camera + 2.
+-- Aim now runs at Camera + 3, after both recoil (+1) and weather (+2), avoiding
+-- equal-priority fights while still running before Last-priority weapon/UI work.
 RunService:BindToRenderStep(
     "PuckAFK_ColdWar_Aim",
-    Enum.RenderPriority.Camera.Value + 2,
+    Enum.RenderPriority.Camera.Value + 3,
     function(dt)
         if not State.Alive then
             return
@@ -1420,20 +1769,26 @@ RunService:BindToRenderStep(
             return
         end
 
-        if FOVCircle then
-            FOVCircle.Visible = Config.Aim.Enabled and Config.Aim.ShowFOV
-            FOVCircle.Position = getAimOrigin2D()
-            FOVCircle.Radius = Config.Aim.FOV
+        local origin2D = getAimOrigin2D()
+
+        if AimbotFOVCircle then
+            AimbotFOVCircle.Visible = Config.Aim.Aimbot and Config.Aim.ShowAimbotFOV
+            AimbotFOVCircle.Position = origin2D
+            AimbotFOVCircle.Radius = Config.Aim.AimbotFOV
         end
 
-        if not aimActivationHeld() then
-            State.CurrentTarget = nil
-            State.CurrentPart = nil
-            State.CurrentAimPoint = nil
+        if SilentAimFOVCircle then
+            SilentAimFOVCircle.Visible = Config.Aim.SilentAim and Config.Aim.ShowSilentAimFOV
+            SilentAimFOVCircle.Position = origin2D
+            SilentAimFOVCircle.Radius = Config.Aim.SilentAimFOV
+        end
+
+        if not aimbotActivationHeld() then
+            clearTarget("Aimbot")
             return
         end
 
-        local player, part, point = selectBestTarget()
+        local player, part, point = selectBestTarget("Aimbot")
         if not player or not part or not point then
             return
         end
@@ -1464,26 +1819,32 @@ connect(RunService.RenderStepped, function()
     end
 end)
 
--- Lightweight status updater
+-- Lightweight user-facing status updater
+local function targetText(target)
+    if target and target.Player and target.Part then
+        return target.Player.Name .. " · " .. target.Part.Name
+    end
+    return "none"
+end
+
 task.spawn(function()
     while State.Alive do
-        local target = State.CurrentTarget
-        if AimStatus and AimStatus.Set then
-            if target and State.CurrentPart then
-                AimStatus:Set(
-                    "Target: " .. target.Name .. " · " .. State.CurrentPart.Name
-                )
+        if AimbotStatus and AimbotStatus.Set then
+            if Config.Aim.Aimbot then
+                AimbotStatus:Set("Aimbot target: " .. targetText(State.Targets.Aimbot))
             else
-                AimStatus:Set("Target: none")
+                AimbotStatus:Set("Aimbot: OFF")
             end
         end
 
-        if BallisticStatus and BallisticStatus.Set then
-            BallisticStatus:Set(
-                State.Ballistics.Installed
-                    and (Config.Aim.BallisticAlign and "Ballistics: align ON" or "Ballistics: hook ready")
-                    or "Ballistics: waiting for PlayerScripts..."
-            )
+        if SilentAimStatus and SilentAimStatus.Set then
+            if not State.Ballistics.Installed then
+                SilentAimStatus:Set("Silent Aim: loading weapon backend...")
+            elseif Config.Aim.SilentAim then
+                SilentAimStatus:Set("Silent Aim target: " .. targetText(State.Targets.SilentAim))
+            else
+                SilentAimStatus:Set("Silent Aim: OFF · ready")
+            end
         end
 
         if ESPStatus and ESPStatus.Set then
@@ -1496,8 +1857,9 @@ task.spawn(function()
                     end
                 end
             end
+
             ESPStatus:Set(
-                (DrawingAvailable and "Drawing ESP ready" or "Drawing unavailable")
+                (DrawingAvailable and "ESP ready" or "Chams ready")
                     .. " · enemies: " .. tostring(enemies)
             )
         end
@@ -1508,6 +1870,6 @@ end)
 
 PuckUI:Notify({
     Title = "Cold War",
-    Content = "Aim + ESP loaded. Visible enemies turn green; occluded enemies stay red. Hold RMB to aim.",
+    Content = "Aimbot and Silent Aim are separate switches. ESP uses green for visible enemies and red for occluded enemies.",
     Duration = 4,
 })
